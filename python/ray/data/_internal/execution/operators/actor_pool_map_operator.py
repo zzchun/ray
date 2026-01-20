@@ -596,7 +596,6 @@ class ActorPoolMapOperator(MapOperator):
     def get_max_concurrency_limit(self) -> Optional[int]:
         return self._actor_pool.max_size() * self._actor_pool.max_actor_concurrency()
 
-
     def _create_actor_pool(
         self,
         compute_strategy: ActorPoolStrategy,

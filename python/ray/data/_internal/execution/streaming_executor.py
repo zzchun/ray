@@ -661,7 +661,6 @@ class StreamingExecutor(Executor, threading.Thread):
             )
             self._metrics_last_updated = now
 
-
     def _use_rich_progress(self):
         rich_enabled = self._data_context.enable_rich_progress_bars
         use_ray_tqdm = self._data_context.use_ray_tqdm
