@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #include "ray/common/runtime_env_common.h"
+
+#include "nlohmann/json.hpp"
+
 namespace ray {
 
 bool IsRuntimeEnvEmpty(const std::string &serialized_runtime_env) {
@@ -21,6 +24,19 @@ bool IsRuntimeEnvEmpty(const std::string &serialized_runtime_env) {
 
 bool IsRuntimeEnvInfoEmpty(const std::string &serialized_runtime_env_info) {
   return serialized_runtime_env_info == "{}" || serialized_runtime_env_info == "";
+}
+
+bool RuntimeEnvUsesContainer(const std::string &serialized_runtime_env) {
+  if (IsRuntimeEnvEmpty(serialized_runtime_env)) {
+    return false;
+  }
+  auto runtime_env = nlohmann::json::parse(serialized_runtime_env,
+                                           /*cb=*/nullptr,
+                                           /*allow_exceptions=*/false);
+  if (runtime_env.is_discarded() || !runtime_env.is_object()) {
+    return false;
+  }
+  return runtime_env.contains("image_uri") || runtime_env.contains("container");
 }
 
 }  // namespace ray

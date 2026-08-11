@@ -1994,6 +1994,11 @@ void NodeManager::HandlePrestartWorkers(rpc::PrestartWorkersRequest request,
       /*runtime_env_hash=*/
       CalculateRuntimeEnvHash(request.runtime_env_info().serialized_runtime_env()),
       /*options=*/std::vector<std::string>{},
+      // Prestarted workers are not tied to a lease, so they hold no accelerator
+      // allocation. A container worker started this way is only handed a lease whose
+      // allocation is empty too, i.e. a lease that asks for no accelerator.
+      SerializeAssignedAcceleratorIds(request.runtime_env_info().serialized_runtime_env(),
+                                      /*allocated_instances=*/nullptr),
       absl::Seconds(request.keep_alive_duration_secs()),
       /*callback=*/
       [request](const std::shared_ptr<WorkerInterface> &worker,

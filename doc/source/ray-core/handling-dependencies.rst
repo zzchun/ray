@@ -652,6 +652,75 @@ The ``runtime_env`` is a Python dictionary or a Python class :class:`ray.runtime
 
   - Example: ``RuntimeEnvConfig(eager_install=False)``
 
+.. _runtime-environments-container-devices:
+
+Accelerator devices in container workers
+""""""""""""""""""""""""""""""""""""""""
+
+A worker started with ``image_uri`` (or the deprecated ``container`` field) runs in its
+own container. Ray gives that container **only the accelerator devices the scheduler
+allocated to the worker**: a task or actor that requests one GPU can open that GPU and no
+other, and a ``num_gpus=0`` worker gets no GPU device at all. Setting
+``CUDA_VISIBLE_DEVICES`` alone would not achieve this, since it only constrains libraries
+that honour it.
+
+Ray picks the injection mechanism per node:
+
+* **CDI** (preferred), when `Container Device Interface <https://github.com/cncf-tags/container-device-interface>`__
+  specs for the ``nvidia.com/gpu`` kind are installed under ``/etc/cdi`` or
+  ``/var/run/cdi``. Generate them with ``nvidia-ctk cdi generate``. Each device is
+  requested by UUID, e.g. ``--device nvidia.com/gpu=GPU-2b0f9c31-...``, which is
+  unambiguous under MIG and independent of device enumeration order.
+* **The NVIDIA Container Toolkit hook**, when its runtime is installed but no CDI specs
+  are. Ray sets ``NVIDIA_VISIBLE_DEVICES`` to the UUIDs of the assigned devices.
+* Neither: Ray logs a warning and adds no device flags, because it has no way to restrict
+  the container. Install the NVIDIA Container Toolkit to get device isolation.
+
+MIG and vGPU instances are handled by the same path. Because Ray enumerates the devices
+the node makes visible, hand MIG instances to Ray by listing their UUIDs in
+``CUDA_VISIBLE_DEVICES`` before starting the raylet; Ray then schedules them individually
+and injects them by MIG UUID.
+
+Inside the container the assigned devices are renumbered from 0, so Ray does not
+additionally set ``CUDA_VISIBLE_DEVICES`` there — it exports
+``RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1`` instead. ``ray.get_gpu_ids()`` keeps
+returning the host-side ids the scheduler allocated.
+
+A container worker is pinned to the devices it was started with, so Ray will not reuse it
+for a task that was allocated a different set of devices.
+
+The following environment variables, read on each node before the raylet starts, control
+this behaviour:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 60
+
+   * - Variable
+     - Meaning
+   * - ``RAY_RUNTIME_ENV_CONTAINER_DEVICE_MODE``
+     - ``auto`` (default), ``cdi``, ``nvidia``, or ``legacy`` to disable device injection
+       entirely and restore the pre-2.57 behaviour.
+   * - ``RAY_RUNTIME_ENV_CONTAINER_CDI_KIND``
+     - CDI kind used to request GPUs. Defaults to ``nvidia.com/gpu``.
+   * - ``RAY_RUNTIME_ENV_CONTAINER_RDMA_DEVICES``
+     - RDMA device nodes to expose to container workers: unset (default) for none,
+       ``auto`` to expose the InfiniBand verbs devices under ``/dev/infiniband``, or a
+       comma-separated list of device node paths. Ray never bind mounts all of ``/dev``
+       and never adds ``--privileged``.
+   * - ``RAY_RUNTIME_ENV_CONTAINER_STRICT_DEVICE_ISOLATION``
+     - When set to ``1``, Ray raises instead of warning if it cannot guarantee isolation,
+       for example when ``run_options`` contain ``--privileged`` or when no GPU-capable
+       container runtime is installed.
+
+.. warning::
+
+   ``run_options`` are applied after Ray's device flags, so options such as
+   ``--privileged``, ``-v /dev:/dev`` or ``--env NVIDIA_VISIBLE_DEVICES=all`` give the
+   worker access to devices that belong to other workers. Ray logs a warning when it sees
+   them, and rejects them under
+   ``RAY_RUNTIME_ENV_CONTAINER_STRICT_DEVICE_ISOLATION=1``.
+
 .. _runtime-environments-caching:
 
 Caching and Garbage Collection

@@ -4,6 +4,7 @@ import os
 import tempfile
 from typing import List, Optional
 
+from ray._private.runtime_env import container_devices
 from ray._private.runtime_env.context import RuntimeEnvContext
 from ray._private.runtime_env.plugin import RuntimeEnvPlugin
 
@@ -27,6 +28,12 @@ with open('/shared/worker_path.txt', 'w') as f:
             "--rm",
             "-v",
             f"{tmpdir}:/shared:Z",
+            # This container only reads a module path out of the image, so it
+            # never needs a GPU. `void` also stops the NVIDIA Container Toolkit
+            # hook from injecting the driver into it.
+            "--env",
+            f"{container_devices.NVIDIA_VISIBLE_DEVICES_ENV_VAR}="
+            f"{container_devices.NVIDIA_VISIBLE_DEVICES_NONE}",
             image_uri,
             "python",
             "-c",
@@ -119,7 +126,15 @@ def _modify_context_impl(
     container_command.append("--env")
     container_command.append("RAY_JOB_ID=$RAY_JOB_ID")
 
+    # Expose only the accelerators the raylet allocated to the worker that ends
+    # up using this command. This context is created once per runtime env and
+    # cached, while the allocation differs per worker, so the device flags are
+    # left as a placeholder that `setup_worker.py` expands per worker. It is
+    # placed before the user's run options so that they keep the last word.
+    container_command.append(container_devices.DEVICE_ARGS_PLACEHOLDER)
+
     if run_options:
+        container_devices.validate_container_run_options(run_options, logger)
         container_command.extend(run_options)
     # TODO(chenk008): add resource limit
     container_command.append("--entrypoint")
@@ -130,6 +145,7 @@ def _modify_context_impl(
     # podman run -v /tmp/ray:/tmp/ray
     # --cgroup-manager=cgroupfs --network=host --pid=host --ipc=host
     # --userns=keep-id --env RAY_RAYLET_PID=23478 --env RAY_JOB_ID=$RAY_JOB_ID
+    # --device nvidia.com/gpu=GPU-2b0f9c31-... --env NVIDIA_VISIBLE_DEVICES=void
     # --entrypoint python rayproject/ray:nightly-py39
     container_command_str = " ".join(container_command)
     logger.info(f"Starting worker in container with prefix {container_command_str}")

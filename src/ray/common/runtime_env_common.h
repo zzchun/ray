@@ -26,4 +26,10 @@ bool IsRuntimeEnvEmpty(const std::string &serialized_runtime_env);
 // or "{}" (from serializing an empty Python dict or a JSON file.)
 bool IsRuntimeEnvInfoEmpty(const std::string &serialized_runtime_env_info);
 
+// Return whether a string representation of a runtime env starts its workers inside a
+// container (via the `image_uri` or the deprecated `container` field).  Such workers get
+// exactly the accelerator devices the raylet allocated injected into the container, which
+// pins each worker to the devices it was started with.
+bool RuntimeEnvUsesContainer(const std::string &serialized_runtime_env);
+
 }  // namespace ray

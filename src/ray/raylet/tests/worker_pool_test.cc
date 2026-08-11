@@ -379,10 +379,12 @@ class WorkerPoolMock : public WorkerPool {
       bool push_workers = true,
       PopWorkerStatus *worker_status = nullptr,
       int timeout_worker_number = 0,
-      std::string *runtime_env_error_msg = nullptr) {
+      std::string *runtime_env_error_msg = nullptr,
+      const std::shared_ptr<TaskResourceInstances> &allocated_instances = nullptr) {
     std::shared_ptr<WorkerInterface> popped_worker = nullptr;
     std::promise<bool> promise;
     this->PopWorker(lease_spec,
+                    allocated_instances,
                     [&popped_worker, worker_status, &promise, runtime_env_error_msg](
                         const std::shared_ptr<WorkerInterface> worker,
                         PopWorkerStatus status,
@@ -858,6 +860,7 @@ TEST_F(WorkerPoolDriverRegisteredTest, TestWorkerStartupKeepAliveDuration) {
           runtime_env_info,
           CalculateRuntimeEnvHash(runtime_env_info.serialized_runtime_env()),
           /*options=*/std::vector<std::string>{},
+          /*serialized_assigned_accelerator_ids=*/"",
           keep_alive_duration,
           /*callback=*/
           [](const std::shared_ptr<WorkerInterface> &worker,
@@ -1200,6 +1203,7 @@ TEST_F(WorkerPoolDriverRegisteredTest, MaximumStartupConcurrency) {
   for (int i = 0; i < MAXIMUM_STARTUP_CONCURRENCY; i++) {
     worker_pool_->PopWorker(
         lease_spec,
+        /*allocated_instances=*/nullptr,
         [](const std::shared_ptr<WorkerInterface> worker,
            PopWorkerStatus status,
            const std::string &runtime_env_setup_error_message) -> bool { return true; });
@@ -1215,6 +1219,7 @@ TEST_F(WorkerPoolDriverRegisteredTest, MaximumStartupConcurrency) {
   // Can't start a new worker process at this point.
   worker_pool_->PopWorker(
       lease_spec,
+      /*allocated_instances=*/nullptr,
       [](const std::shared_ptr<WorkerInterface> worker,
          PopWorkerStatus status,
          const std::string &runtime_env_setup_error_message) -> bool { return true; });
@@ -1242,6 +1247,7 @@ TEST_F(WorkerPoolDriverRegisteredTest, MaximumStartupConcurrency) {
   ASSERT_EQ(MAXIMUM_STARTUP_CONCURRENCY, worker_pool_->NumWorkersStarting());
   worker_pool_->PopWorker(
       lease_spec,
+      /*allocated_instances=*/nullptr,
       [](const std::shared_ptr<WorkerInterface> worker,
          PopWorkerStatus status,
          const std::string &runtime_env_setup_error_message) -> bool { return true; });
@@ -1262,6 +1268,7 @@ TEST_F(WorkerPoolDriverRegisteredTest, MaximumStartupConcurrency) {
   // Can't start a new worker process at this point.
   worker_pool_->PopWorker(
       lease_spec,
+      /*allocated_instances=*/nullptr,
       [](const std::shared_ptr<WorkerInterface> worker,
          PopWorkerStatus status,
          const std::string &runtime_env_setup_error_message) -> bool { return true; });
@@ -1838,6 +1845,7 @@ TEST_F(WorkerPoolDriverRegisteredTest, TestJobFinishedForPopWorker) {
   std::promise<bool> promise;
   worker_pool_->PopWorker(
       lease_spec,
+      /*allocated_instances=*/nullptr,
       [&](const std::shared_ptr<WorkerInterface> worker,
           PopWorkerStatus status,
           const std::string &runtime_env_setup_error_message) -> bool {
@@ -2219,6 +2227,7 @@ TEST_F(WorkerPoolDriverRegisteredTest, WorkerNoLeaks) {
 
   // Pop a worker and don't dispatch.
   worker_pool_->PopWorker(lease_spec,
+                          /*allocated_instances=*/nullptr,
                           [](const std::shared_ptr<WorkerInterface> worker,
                              PopWorkerStatus status,
                              const std::string &runtime_env_setup_error_message) -> bool {
@@ -2235,6 +2244,7 @@ TEST_F(WorkerPoolDriverRegisteredTest, WorkerNoLeaks) {
   ASSERT_EQ(worker_pool_->GetIdleWorkerSize(), 1);
   // Pop a worker and don't dispatch.
   worker_pool_->PopWorker(lease_spec,
+                          /*allocated_instances=*/nullptr,
                           [](const std::shared_ptr<WorkerInterface> worker,
                              PopWorkerStatus status,
                              const std::string &runtime_env_setup_error_message) -> bool {
@@ -2246,6 +2256,7 @@ TEST_F(WorkerPoolDriverRegisteredTest, WorkerNoLeaks) {
   ASSERT_EQ(worker_pool_->GetProcessSize(), 1);
   // Pop a worker and dispatch.
   worker_pool_->PopWorker(lease_spec,
+                          /*allocated_instances=*/nullptr,
                           [](const std::shared_ptr<WorkerInterface> worker,
                              PopWorkerStatus status,
                              const std::string &runtime_env_setup_error_message) -> bool {
@@ -2536,6 +2547,130 @@ TEST_F(WorkerPoolTest, RegisterFirstJavaDriverCallbackImmediately) {
   };
   RAY_CHECK_OK(worker_pool_->RegisterDriver(driver, rpc::JobConfig(), callback));
   ASSERT_TRUE(callback_called);
+}
+
+namespace {
+
+std::shared_ptr<TaskResourceInstances> GpuInstances(
+    const std::vector<double> &per_instance_allocation) {
+  auto instances = std::make_shared<TaskResourceInstances>();
+  std::vector<FixedPoint> values;
+  values.reserve(per_instance_allocation.size());
+  for (double value : per_instance_allocation) {
+    values.emplace_back(value);
+  }
+  instances->Set(scheduling::ResourceID::GPU(), values);
+  return instances;
+}
+
+constexpr char kContainerRuntimeEnv[] = R"({"image_uri": "podman://cuda-ray"})";
+
+}  // namespace
+
+TEST(SerializeAssignedAcceleratorIdsTest, OnlyContainerRuntimeEnvsPinDevices) {
+  auto instances = GpuInstances({0, 1, 1});
+
+  // Non-container workers are untouched, so their reuse behaviour is unchanged.
+  ASSERT_EQ(SerializeAssignedAcceleratorIds("", instances), "");
+  ASSERT_EQ(SerializeAssignedAcceleratorIds("{}", instances), "");
+  ASSERT_EQ(SerializeAssignedAcceleratorIds(R"({"pip": ["torch"]})", instances), "");
+
+  // A malformed runtime env must not take the raylet down.
+  ASSERT_EQ(SerializeAssignedAcceleratorIds("{not json", instances), "");
+  ASSERT_EQ(SerializeAssignedAcceleratorIds("[]", instances), "");
+}
+
+TEST(SerializeAssignedAcceleratorIdsTest, ReportsTheAllocatedInstanceIds) {
+  // Instances 1 and 2 are allocated; instance 0 is not.
+  ASSERT_EQ(
+      SerializeAssignedAcceleratorIds(kContainerRuntimeEnv, GpuInstances({0, 1, 1})),
+      R"({"GPU":["1","2"]})");
+  // Fractional GPU allocations still name the instance they share.
+  ASSERT_EQ(SerializeAssignedAcceleratorIds(kContainerRuntimeEnv, GpuInstances({0.5})),
+            R"({"GPU":["0"]})");
+  ASSERT_EQ(SerializeAssignedAcceleratorIds(R"({"container": {"image": "cuda-ray"}})",
+                                            GpuInstances({1})),
+            R"({"GPU":["0"]})");
+}
+
+TEST(SerializeAssignedAcceleratorIdsTest, ReportsAnEmptyAllocationForCpuOnlyWorkers) {
+  // An empty allocation is reported explicitly, which is what makes a CPU-only
+  // container worker distinguishable from a worker with no allocation at all.
+  auto cpu_only = std::make_shared<TaskResourceInstances>();
+  cpu_only->Set(scheduling::ResourceID::CPU(), {FixedPoint(1)});
+  ASSERT_EQ(SerializeAssignedAcceleratorIds(kContainerRuntimeEnv, cpu_only),
+            R"({"GPU":[]})");
+  ASSERT_EQ(SerializeAssignedAcceleratorIds(kContainerRuntimeEnv, GpuInstances({0, 0})),
+            R"({"GPU":[]})");
+  ASSERT_EQ(SerializeAssignedAcceleratorIds(kContainerRuntimeEnv, nullptr),
+            R"({"GPU":[]})");
+}
+
+TEST_F(WorkerPoolDriverRegisteredTest, ContainerWorkerIsPinnedToItsAssignedGpus) {
+  rpc::RuntimeEnvInfo runtime_env_info;
+  runtime_env_info.set_serialized_runtime_env(kContainerRuntimeEnv);
+  const auto lease_spec = ExampleLeaseSpec(/*actor_creation_id=*/ActorID::Nil(),
+                                           Language::PYTHON,
+                                           JOB_ID,
+                                           /*dynamic_worker_options=*/{},
+                                           /*lease_id=*/LeaseID::Nil(),
+                                           runtime_env_info,
+                                           /*resources=*/{{"CPU", 1}, {"GPU", 1}});
+
+  auto first_gpu = GpuInstances({1, 0});
+  auto second_gpu = GpuInstances({0, 1});
+
+  auto worker =
+      PopWorkerSync(lease_spec, /*push_workers=*/true, nullptr, 0, nullptr, first_gpu);
+  ASSERT_NE(worker, nullptr);
+  ASSERT_EQ(worker_pool_->GetProcessSize(), 1);
+
+  // A lease allocated the same device reuses the container it was started with.
+  worker_pool_->PushWorker(worker);
+  ASSERT_EQ(
+      PopWorkerSync(lease_spec, /*push_workers=*/true, nullptr, 0, nullptr, first_gpu),
+      worker);
+  ASSERT_EQ(worker_pool_->GetProcessSize(), 1);
+
+  // A lease allocated a different device must not reuse it: that device was never
+  // injected into the container, so the worker could not open it.
+  worker_pool_->PushWorker(worker);
+  auto other_worker =
+      PopWorkerSync(lease_spec, /*push_workers=*/true, nullptr, 0, nullptr, second_gpu);
+  ASSERT_NE(other_worker, nullptr);
+  ASSERT_NE(other_worker, worker);
+  ASSERT_EQ(worker_pool_->GetProcessSize(), 2);
+
+  worker_pool_->ClearProcesses();
+}
+
+TEST_F(WorkerPoolDriverRegisteredTest, NonContainerGpuWorkersAreStillReused) {
+  // Without a container there is nothing baked into the worker, so Ray keeps
+  // reusing a GPU worker across different device allocations as it always has.
+  const auto lease_spec = ExampleLeaseSpec(/*actor_creation_id=*/ActorID::Nil(),
+                                           Language::PYTHON,
+                                           JOB_ID,
+                                           /*dynamic_worker_options=*/{},
+                                           /*lease_id=*/LeaseID::Nil(),
+                                           rpc::RuntimeEnvInfo(),
+                                           /*resources=*/{{"CPU", 1}, {"GPU", 1}});
+
+  auto worker = PopWorkerSync(
+      lease_spec, /*push_workers=*/true, nullptr, 0, nullptr, GpuInstances({1, 0}));
+  ASSERT_NE(worker, nullptr);
+  ASSERT_EQ(worker_pool_->GetProcessSize(), 1);
+
+  worker_pool_->PushWorker(worker);
+  ASSERT_EQ(PopWorkerSync(lease_spec,
+                          /*push_workers=*/true,
+                          nullptr,
+                          0,
+                          nullptr,
+                          GpuInstances({0, 1})),
+            worker);
+  ASSERT_EQ(worker_pool_->GetProcessSize(), 1);
+
+  worker_pool_->ClearProcesses();
 }
 
 }  // namespace ray::raylet

@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "absl/strings/str_cat.h"
 #include "absl/strings/str_format.h"
 #include "absl/strings/str_split.h"
 #include "ray/common/constants.h"
@@ -83,6 +84,31 @@ bool OptionalsMatchOrEitherEmpty(const std::optional<bool> &ask,
 }
 
 }  // namespace
+
+std::string SerializeAssignedAcceleratorIds(
+    const std::string &serialized_runtime_env,
+    const std::shared_ptr<TaskResourceInstances> &allocated_instances) {
+  if (!RuntimeEnvUsesContainer(serialized_runtime_env)) {
+    return "";
+  }
+  std::string gpu_ids;
+  if (allocated_instances != nullptr &&
+      allocated_instances->Has(scheduling::ResourceID::GPU())) {
+    const auto &instances = allocated_instances->Get(scheduling::ResourceID::GPU());
+    for (size_t instance_index = 0; instance_index < instances.size(); instance_index++) {
+      if (instances[instance_index] <= 0) {
+        continue;
+      }
+      if (!gpu_ids.empty()) {
+        gpu_ids += ",";
+      }
+      absl::StrAppend(&gpu_ids, "\"", instance_index, "\"");
+    }
+  }
+  // Hand-rolled rather than built with a JSON library because every value is a
+  // non-negative integer rendered as a string, so there is nothing to escape.
+  return absl::StrCat("{\"GPU\":[", gpu_ids, "]}");
+}
 
 WorkerPool::WorkerPool(instrumented_io_context &io_service,
                        std::shared_ptr<PeriodicalRunnerInterface> periodical_runner,
@@ -245,7 +271,8 @@ const ProcessInterface &WorkerPool::AddWorkerProcess(
     SteadyTimePoint start,
     const rpc::RuntimeEnvInfo &runtime_env_info,
     const std::vector<std::string> &dynamic_options,
-    std::optional<absl::Duration> worker_startup_keep_alive_duration) {
+    std::optional<absl::Duration> worker_startup_keep_alive_duration,
+    const std::string &serialized_assigned_accelerator_ids) {
   auto [it, _] = state.worker_processes.emplace(
       worker_id,
       WorkerProcessInfo{/*is_pending_registration=*/true,
@@ -254,7 +281,8 @@ const ProcessInterface &WorkerPool::AddWorkerProcess(
                         start,
                         runtime_env_info,
                         dynamic_options,
-                        worker_startup_keep_alive_duration});
+                        worker_startup_keep_alive_duration,
+                        serialized_assigned_accelerator_ids});
   return *it->second.proc;
 }
 
@@ -263,15 +291,17 @@ void WorkerPool::RemoveWorkerProcess(State &state, const WorkerID &worker_id) {
 }
 
 std::pair<std::vector<std::string>, ProcessEnvironment>
-WorkerPool::BuildProcessCommandArgs(const Language &language,
-                                    rpc::JobConfig *job_config,
-                                    const rpc::WorkerType worker_type,
-                                    const JobID &job_id,
-                                    const WorkerID &worker_id,
-                                    const std::vector<std::string> &dynamic_options,
-                                    const int runtime_env_hash,
-                                    const std::string &serialized_runtime_env_context,
-                                    const WorkerPool::State &state) const {
+WorkerPool::BuildProcessCommandArgs(
+    const Language &language,
+    rpc::JobConfig *job_config,
+    const rpc::WorkerType worker_type,
+    const JobID &job_id,
+    const WorkerID &worker_id,
+    const std::vector<std::string> &dynamic_options,
+    const int runtime_env_hash,
+    const std::string &serialized_runtime_env_context,
+    const std::string &serialized_assigned_accelerator_ids,
+    const WorkerPool::State &state) const {
   std::vector<std::string> options;
 
   // Append Ray-defined per-job options here
@@ -449,6 +479,13 @@ WorkerPool::BuildProcessCommandArgs(const Language &language,
     env.insert({"SPT_NOENV", "1"});
   }
 
+  // Tell the worker startup process which accelerators this worker holds, so that a
+  // container worker is given exactly those devices instead of every device on the node.
+  // Only set for container workers; see `SerializeAssignedAcceleratorIds`.
+  if (!serialized_assigned_accelerator_ids.empty()) {
+    env.insert({kRayAssignedAcceleratorIdsEnvVar, serialized_assigned_accelerator_ids});
+  }
+
   if (RayConfig::instance().support_fork()) {
     // Support forking in gRPC.
     env.insert({"GRPC_ENABLE_FORK_SUPPORT", "True"});
@@ -468,7 +505,8 @@ std::tuple<const ProcessInterface &, WorkerID> WorkerPool::StartWorkerProcess(
     const int runtime_env_hash,
     const std::string &serialized_runtime_env_context,
     const rpc::RuntimeEnvInfo &runtime_env_info,
-    std::optional<absl::Duration> worker_startup_keep_alive_duration) {
+    std::optional<absl::Duration> worker_startup_keep_alive_duration,
+    const std::string &serialized_assigned_accelerator_ids) {
   rpc::JobConfig *job_config = nullptr;
   if (!job_id.IsNil()) {
     auto it = all_jobs_.find(job_id);
@@ -521,6 +559,7 @@ std::tuple<const ProcessInterface &, WorkerID> WorkerPool::StartWorkerProcess(
                               dynamic_options,
                               runtime_env_hash,
                               serialized_runtime_env_context,
+                              serialized_assigned_accelerator_ids,
                               state);
 
   SteadyTimePoint start = clock_.SteadyNow();
@@ -542,7 +581,8 @@ std::tuple<const ProcessInterface &, WorkerID> WorkerPool::StartWorkerProcess(
                        start,
                        runtime_env_info,
                        dynamic_options,
-                       worker_startup_keep_alive_duration);
+                       worker_startup_keep_alive_duration,
+                       serialized_assigned_accelerator_ids);
   if (IsIOWorkerType(worker_type)) {
     auto &io_worker_state = GetIOWorkerStateFromWorkerType(worker_type, state);
     io_worker_state.num_starting_io_workers++;
@@ -1367,6 +1407,14 @@ WorkerUnfitForLeaseReason WorkerPool::WorkerFitForLease(
       pop_worker_request.dynamic_options_) {
     return WorkerUnfitForLeaseReason::DYNAMIC_OPTIONS_MISMATCH;
   }
+  // A container worker was started with exactly the accelerator devices of the lease it
+  // was started for, so it cannot run a lease that was allocated a different set: the
+  // devices are not in its container. Both sides are empty for non-container workers,
+  // which leaves their reuse untouched.
+  if (LookupWorkerAssignedAcceleratorIds(worker.WorkerId()) !=
+      pop_worker_request.serialized_assigned_accelerator_ids_) {
+    return WorkerUnfitForLeaseReason::ASSIGNED_ACCELERATORS_MISMATCH;
+  }
   return WorkerUnfitForLeaseReason::NONE;
 }
 
@@ -1389,7 +1437,8 @@ void WorkerPool::StartNewWorker(
                            request->runtime_env_hash_,
                            serialized_runtime_env_context,
                            request->runtime_env_info_,
-                           request->worker_startup_keep_alive_duration_);
+                           request->worker_startup_keep_alive_duration_,
+                           request->serialized_assigned_accelerator_ids_);
     if (status == PopWorkerStatus::OK) {
       RAY_CHECK(proc.IsValid());
       WarnAboutSize();
@@ -1434,8 +1483,10 @@ void WorkerPool::StartNewWorker(
   }
 }
 
-void WorkerPool::PopWorker(const LeaseSpecification &lease_spec,
-                           const PopWorkerCallback &callback) {
+void WorkerPool::PopWorker(
+    const LeaseSpecification &lease_spec,
+    const std::shared_ptr<TaskResourceInstances> &allocated_instances,
+    const PopWorkerCallback &callback) {
   auto pop_worker_request = std::make_shared<PopWorkerRequest>(
       lease_spec.GetLanguage(),
       rpc::WorkerType::WORKER,
@@ -1446,6 +1497,8 @@ void WorkerPool::PopWorker(const LeaseSpecification &lease_spec,
       lease_spec.RuntimeEnvInfo(),
       lease_spec.GetRuntimeEnvHash(),
       lease_spec.DynamicWorkerOptionsOrEmpty(),
+      SerializeAssignedAcceleratorIds(lease_spec.SerializedRuntimeEnv(),
+                                      allocated_instances),
       /*worker_startup_keep_alive_duration=*/std::nullopt,
       [this, lease_spec, callback](
           const std::shared_ptr<WorkerInterface> &worker,
@@ -1601,7 +1654,14 @@ void WorkerPool::PrestartWorkersInternal(const LeaseSpecification &lease_spec,
                              /*dynamic_options=*/{},
                              lease_spec.GetRuntimeEnvHash(),
                              serialized_runtime_env_context,
-                             lease_spec.RuntimeEnvInfo());
+                             lease_spec.RuntimeEnvInfo(),
+                             /*worker_startup_keep_alive_duration=*/std::nullopt,
+                             // A prestarted worker is not tied to a lease yet, so there
+                             // is no allocation to inject. `WorkerFitForLease` will only
+                             // hand it a lease whose allocation is empty too, which for
+                             // a container worker means a CPU-only lease.
+                             SerializeAssignedAcceleratorIds(
+                                 lease_spec.SerializedRuntimeEnv(), nullptr));
         });
   }
 }
@@ -1917,6 +1977,18 @@ const std::vector<std::string> &WorkerPool::LookupWorkerDynamicOptions(
   }
   static std::vector<std::string> kNoDynamicOptions;
   return kNoDynamicOptions;
+}
+
+const std::string &WorkerPool::LookupWorkerAssignedAcceleratorIds(
+    const WorkerID &worker_id) const {
+  for (const auto &[lang, state] : states_by_lang_) {
+    auto it = state.worker_processes.find(worker_id);
+    if (it != state.worker_processes.end()) {
+      return it->second.serialized_assigned_accelerator_ids;
+    }
+  }
+  static std::string kNoAssignedAcceleratorIds;
+  return kNoAssignedAcceleratorIds;
 }
 
 const NodeID &WorkerPool::GetNodeID() const { return node_id_; }

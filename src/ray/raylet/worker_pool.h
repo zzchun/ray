@@ -37,6 +37,7 @@
 #include "ray/asio/periodical_runner_interface.h"
 #include "ray/common/lease/lease.h"
 #include "ray/common/runtime_env_manager.h"
+#include "ray/common/scheduling/cluster_resource_data.h"
 #include "ray/gcs_rpc_client/gcs_client.h"
 #include "ray/raylet/metrics.h"
 #include "ray/raylet/runtime_env_agent_client.h"
@@ -102,6 +103,13 @@ struct PopWorkerRequest {
   const rpc::RuntimeEnvInfo runtime_env_info_;
   const int runtime_env_hash_;
   const std::vector<std::string> dynamic_options_;
+  /// The accelerator instances allocated to the lease, as a JSON object mapping a
+  /// resource name to the allocated instance ids, e.g. `{"GPU":["0","3"]}`.  Only set
+  /// for leases whose runtime env starts the worker in a container, because those
+  /// workers get exactly these devices injected and can therefore not be reused for a
+  /// lease that was allocated different ones.  Empty for every other lease, which keeps
+  /// worker reuse unchanged for them.
+  const std::string serialized_assigned_accelerator_ids_;
   std::optional<absl::Duration> worker_startup_keep_alive_duration_;
 
   PopWorkerCallback callback_;
@@ -115,6 +123,7 @@ struct PopWorkerRequest {
                    rpc::RuntimeEnvInfo runtime_env_info,
                    int runtime_env_hash,
                    std::vector<std::string> options,
+                   std::string serialized_assigned_accelerator_ids,
                    std::optional<absl::Duration> worker_startup_keep_alive_duration,
                    PopWorkerCallback callback)
       : language_(lang),
@@ -126,9 +135,28 @@ struct PopWorkerRequest {
         runtime_env_info_(std::move(runtime_env_info)),
         runtime_env_hash_(runtime_env_hash),
         dynamic_options_(std::move(options)),
+        serialized_assigned_accelerator_ids_(
+            std::move(serialized_assigned_accelerator_ids)),
         worker_startup_keep_alive_duration_(worker_startup_keep_alive_duration),
         callback_(std::move(callback)) {}
 };
+
+/// Serialize the accelerator instances allocated to a lease into the JSON object that the
+/// worker startup process reads from RAY_ASSIGNED_ACCELERATOR_IDS, e.g. `{"GPU":["0"]}`.
+/// The instance index is the index into the node's visible accelerator list, which is the
+/// same numbering the worker uses for CUDA_VISIBLE_DEVICES.
+///
+/// Only non-empty for runtime envs that start the worker in a container: those workers
+/// have their devices baked in at startup, so the raylet must not hand them a lease that
+/// was allocated a different set. Every other runtime env gets an empty string, which
+/// leaves worker reuse for them exactly as it was.
+///
+/// \param serialized_runtime_env The serialized runtime env of the lease.
+/// \param allocated_instances The resource instances allocated to the lease. nullptr when
+/// the worker is not being started for a specific lease, e.g. when prestarting.
+std::string SerializeAssignedAcceleratorIds(
+    const std::string &serialized_runtime_env,
+    const std::shared_ptr<TaskResourceInstances> &allocated_instances);
 
 /// \class IOWorkerPoolInterface
 ///
@@ -175,8 +203,14 @@ class WorkerPoolInterface : public IOWorkerPoolInterface {
   /// Case 1: An suitable worker was found in idle worker pool.
   /// Case 2: An suitable worker registered to raylet.
   /// The corresponding PopWorkerStatus will be passed to the callback.
-  virtual void PopWorker(const LeaseSpecification &lease_spec,
-                         const PopWorkerCallback &callback) = 0;
+  ///
+  /// \param allocated_instances The resource instances already allocated to the lease.
+  /// Used to give a container worker exactly the accelerator devices the lease holds;
+  /// may be nullptr when the caller has no allocation (e.g. tests).
+  virtual void PopWorker(
+      const LeaseSpecification &lease_spec,
+      const std::shared_ptr<TaskResourceInstances> &allocated_instances,
+      const PopWorkerCallback &callback) = 0;
   /// Add an idle worker to the pool.
   ///
   /// \param The idle worker to add.
@@ -257,11 +291,12 @@ class WorkerInterface;
 class Worker;
 
 enum class WorkerUnfitForLeaseReason {
-  NONE = 0,                      // OK
-  ROOT_MISMATCH = 1,             // job ID or root detached actor ID mismatch
-  RUNTIME_ENV_MISMATCH = 2,      // runtime env hash mismatch
-  DYNAMIC_OPTIONS_MISMATCH = 3,  // dynamic options mismatch
-  OTHERS = 4,                    // reasons we don't do stats for (e.g. language)
+  NONE = 0,                            // OK
+  ROOT_MISMATCH = 1,                   // job ID or root detached actor ID mismatch
+  RUNTIME_ENV_MISMATCH = 2,            // runtime env hash mismatch
+  DYNAMIC_OPTIONS_MISMATCH = 3,        // dynamic options mismatch
+  OTHERS = 4,                          // reasons we don't do stats for (e.g. language)
+  ASSIGNED_ACCELERATORS_MISMATCH = 5,  // container worker pinned to other devices
 };
 static constexpr std::string_view kWorkerUnfitForLeaseReasonDebugName[] = {
     "NONE",
@@ -269,6 +304,7 @@ static constexpr std::string_view kWorkerUnfitForLeaseReasonDebugName[] = {
     "RUNTIME_ENV_MISMATCH",
     "DYNAMIC_OPTIONS_MISMATCH",
     "OTHERS",
+    "ASSIGNED_ACCELERATORS_MISMATCH",
 };
 
 inline std::ostream &operator<<(std::ostream &os,
@@ -485,6 +521,7 @@ class WorkerPool : public WorkerPoolInterface {
 
   /// See interface.
   void PopWorker(const LeaseSpecification &lease_spec,
+                 const std::shared_ptr<TaskResourceInstances> &allocated_instances,
                  const PopWorkerCallback &callback) override;
 
   /// Try to prestart a number of workers suitable the given lease spec. Prestarting
@@ -585,6 +622,9 @@ class WorkerPool : public WorkerPoolInterface {
   /// \param worker_startup_keep_alive_duration If set, the worker will be kept alive for
   ///   this duration even if it's idle. This is only applicable before a lease is
   ///   assigned to the worker.
+  /// \param serialized_assigned_accelerator_ids The accelerator instances allocated to
+  ///   the lease this worker is started for, as a JSON object. Passed to the worker
+  ///   startup process so that a container worker is given exactly those devices.
   /// \return The process that we started and the worker ID assigned to it. If the worker
   /// ID is nil, we didn't start a process.
   std::tuple<const ProcessInterface &, WorkerID> StartWorkerProcess(
@@ -596,7 +636,8 @@ class WorkerPool : public WorkerPoolInterface {
       int runtime_env_hash = 0,
       const std::string &serialized_runtime_env_context = "{}",
       const rpc::RuntimeEnvInfo &runtime_env_info = rpc::RuntimeEnvInfo(),
-      std::optional<absl::Duration> worker_startup_keep_alive_duration = std::nullopt);
+      std::optional<absl::Duration> worker_startup_keep_alive_duration = std::nullopt,
+      const std::string &serialized_assigned_accelerator_ids = "");
 
   /// The implementation of how to start a new worker process with command arguments.
   /// The lifetime of the process is tied to that of the returned object,
@@ -624,6 +665,11 @@ class WorkerPool : public WorkerPoolInterface {
   /// TODO(scv119): replace dynamic options by runtime_env.
   const std::vector<std::string> &LookupWorkerDynamicOptions(
       const WorkerID &worker_id) const;
+
+  /// Look up the accelerator instances a worker process was started with, by worker ID.
+  /// Empty unless the worker runs in a container, which is the case where the devices
+  /// are baked into the worker at startup.
+  const std::string &LookupWorkerAssignedAcceleratorIds(const WorkerID &worker_id) const;
 
   struct IOWorkerState {
     /// The pool of idle I/O workers.
@@ -653,6 +699,11 @@ class WorkerPool : public WorkerPoolInterface {
     std::vector<std::string> dynamic_options;
     /// The duration to keep the newly created worker alive before it's assigned a lease.
     std::optional<absl::Duration> worker_startup_keep_alive_duration;
+    /// The accelerator instances this worker process was started with, in the same
+    /// encoding as `PopWorkerRequest::serialized_assigned_accelerator_ids_`.  A
+    /// container worker had exactly these devices injected, so it can only serve leases
+    /// that were allocated the same ones.
+    std::string serialized_assigned_accelerator_ids;
   };
 
   /// An internal data structure that maintains the pool state per language.
@@ -833,7 +884,8 @@ class WorkerPool : public WorkerPoolInterface {
       SteadyTimePoint start,
       const rpc::RuntimeEnvInfo &runtime_env_info,
       const std::vector<std::string> &dynamic_options,
-      std::optional<absl::Duration> worker_startup_keep_alive_duration);
+      std::optional<absl::Duration> worker_startup_keep_alive_duration,
+      const std::string &serialized_assigned_accelerator_ids);
 
   void RemoveWorkerProcess(State &state, const WorkerID &worker_id);
 
@@ -850,6 +902,7 @@ class WorkerPool : public WorkerPoolInterface {
       const std::vector<std::string> &dynamic_options,
       int runtime_env_hash,
       const std::string &serialized_runtime_env_context,
+      const std::string &serialized_assigned_accelerator_ids,
       const WorkerPool::State &state) const;
 
   void ExecuteOnPrestartWorkersStarted(std::function<void()> callback);

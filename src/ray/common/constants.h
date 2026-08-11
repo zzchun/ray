@@ -57,6 +57,13 @@ constexpr int kPublicDNSServerPort = 53;
 constexpr char kEnvVarKeyJobId[] = "RAY_JOB_ID";
 constexpr char kEnvVarKeyRayletPid[] = "RAY_RAYLET_PID";
 
+/// Accelerator instances allocated to the lease a worker process is started for, as a
+/// JSON object, e.g. `{"GPU":["0","3"]}`.  Read by setup_worker.py to expose exactly
+/// those devices to a container worker.
+/// Should be kept in sync with RAY_ASSIGNED_ACCELERATOR_IDS_ENV_VAR in
+/// runtime_env/container_devices.py.
+constexpr char kRayAssignedAcceleratorIdsEnvVar[] = "RAY_ASSIGNED_ACCELERATOR_IDS";
+
 constexpr char kEnvVarKeyGrpcThreadCount[] = "RAY_num_grpc_internal_threads";
 
 /// for cross-langueage serialization
