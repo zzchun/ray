@@ -37,10 +37,13 @@ from ray.autoscaler.v2.tests.util import (
     make_autoscaler_instance,
 )
 from ray.autoscaler.v2.underutilized_drain import (
+    RAY_DATA_MAP_WORKER_CLASS_NAME_PREFIX,
+    RAY_DATA_MAP_WORKER_MODULE,
     UNDERUTILIZED_DRAIN_DETAILS_PREFIX,
     ActorOnNode,
     DrainRecord,
     NodeWorkload,
+    NodeWorkloadFetcher,
     RunningTask,
     UnderutilizationTracker,
     UnderutilizedDrainInput,
@@ -48,7 +51,9 @@ from ray.autoscaler.v2.underutilized_drain import (
     UnderutilizedNodeDrainer,
     build_node_workload,
     dominant_utilization,
+    get_workload_growth_reason,
     get_workload_skip_reason,
+    is_ray_data_map_worker,
     is_underutilized_drain_request,
     parse_label_selector,
     placement_resources,
@@ -116,6 +121,8 @@ def _actor_data(
     max_restarts: int = -1,
     label_selector: Optional[Dict[str, str]] = None,
     placement_group_id: Optional[bytes] = None,
+    module_name: str = RAY_DATA_MAP_WORKER_MODULE,
+    class_name: str = "MapWorker(Map(fn))",
 ) -> ActorTableData:
     data = ActorTableData(
         actor_id=actor_id,
@@ -129,6 +136,9 @@ def _actor_data(
     )
     if placement_group_id is not None:
         data.placement_group_id = placement_group_id
+    data.class_name = class_name
+    data.function_descriptor.python_function_descriptor.module_name = module_name
+    data.function_descriptor.python_function_descriptor.class_name = class_name
     return data
 
 
@@ -149,6 +159,8 @@ def _actor(
         in_placement_group=False,
         max_restarts=-1,
         is_detached=False,
+        class_name="MapWorker(Map(fn))",
+        is_ray_data_map_worker=True,
     )
     fields.update(kwargs)
     return ActorOnNode(**fields)
@@ -216,6 +228,44 @@ def test_dominant_utilization():
     ) == pytest.approx(1.0)
     assert dominant_utilization({"CPU": 4}, {"CPU": 3}) == pytest.approx(0.25)
     assert dominant_utilization({}, {}) == 0.0
+
+
+@pytest.mark.parametrize(
+    "module_name,class_name,expected",
+    [
+        (RAY_DATA_MAP_WORKER_MODULE, "MapWorker(Map(fn))", True),
+        (RAY_DATA_MAP_WORKER_MODULE, "_MapWorker", True),
+        (RAY_DATA_MAP_WORKER_MODULE, "_ActorPool", False),
+        ("ray.serve._private.replica", "MapWorker(x)", False),
+        ("__main__", "MapWorker(Map(fn))", False),
+    ],
+)
+def test_is_ray_data_map_worker(module_name, class_name, expected):
+    assert is_ray_data_map_worker(module_name, class_name) == expected
+
+
+def test_ray_data_map_worker_matches_ray_data():
+    # The identification and the restart assumptions rely on Ray Data's actor
+    # pool implementation.
+    from ray.data._internal.execution.operators import actor_pool_map_operator
+    from ray.data.context import DataContext
+
+    worker_cls = type(
+        actor_pool_map_operator.get_map_worker_cls_name("Map(fn)"),
+        (actor_pool_map_operator._MapWorker,),
+        {"__module__": actor_pool_map_operator.__name__},
+    )
+    assert actor_pool_map_operator.__name__ == RAY_DATA_MAP_WORKER_MODULE
+    assert worker_cls.__name__.startswith(RAY_DATA_MAP_WORKER_CLASS_NAME_PREFIX)
+    assert is_ray_data_map_worker(worker_cls.__module__, worker_cls.__name__)
+
+    remote_args = (
+        actor_pool_map_operator.ActorPoolMapOperator._apply_default_remote_args(
+            {}, DataContext.get_current()
+        )
+    )
+    assert remote_args["max_restarts"] == -1
+    assert remote_args["max_task_retries"] == -1
 
 
 def test_config_parsing():
@@ -366,6 +416,8 @@ def test_build_node_workload():
     assert actor.placement_resources == {"CPU": 2}
     assert actor.label_selector == [("zone", IN, ["a", "b"])]
     assert actor.max_restarts == -1
+    assert actor.is_ray_data_map_worker
+    assert actor.class_name == "MapWorker(Map(fn))"
 
     stats.append(_worker_stats(b"w5", worker_type=WorkerType.DRIVER))
     workload = build_node_workload("n", stats, actors, {"CPU": 3}, 0.01, 5)
@@ -425,6 +477,7 @@ def test_nil_actor_id_is_not_an_actor():
     "actor_kwargs,config_kwargs,expected_prefix",
     [
         ({}, {}, None),
+        ({"is_ray_data_map_worker": False}, {}, "not_migratable"),
         ({"max_restarts": 0}, {}, "not_migratable"),
         ({"in_placement_group": True}, {}, "not_migratable"),
         ({"label_selector": None}, {}, "not_migratable"),
@@ -797,7 +850,10 @@ def test_max_concurrent_draining_quota(max_concurrent, num_draining, expected):
     ]
     workloads = {"r-0": _workload("r-0", actors=[_actor("a1", {"CPU": 1})])}
     drain_input = _drain_input(workloads, max_concurrent_draining=max_concurrent)
-    drain_input.draining_instance_ids = {f"i-x{i}" for i in range(num_draining)}
+    # Draining nodes are counted from the instance manager, including those
+    # drained for other reasons or before an autoscaler restart.
+    drain_input.num_draining_nodes = num_draining
+    drain_input.num_worker_nodes = 4 + num_draining
     assert len(_drained(_schedule(instances, drain_input))) == expected
 
 
@@ -826,6 +882,37 @@ def test_reservations_of_draining_nodes():
     assert [r.ray_node_id for r in reply.to_terminate] == ["r-1"]
 
 
+def test_draining_nodes_count_towards_max_workers():
+    node_type_configs = dict(NODE_TYPE_CONFIGS)
+    node_type_configs["cpu"] = NodeTypeConfig(
+        name="cpu", resources={"CPU": 4}, min_worker_nodes=0, max_worker_nodes=2
+    )
+    instances = [
+        _head(),
+        _instance("r-1", available_cpu=0),
+        _instance("r-9", available_cpu=3, status=Instance.RAY_STOPPING),
+    ]
+    drain_input = _drain_input({})
+    drain_input.draining_instance_ids = {"i-r-9"}
+    with mock.patch.dict(NODE_TYPE_CONFIGS, node_type_configs):
+        reply = _schedule(
+            instances,
+            drain_input,
+            resource_requests=[ResourceRequestUtil.make({"CPU": 4})],
+        )
+        # The draining node still counts: no room to launch another node.
+        assert reply.to_launch == []
+        assert reply.to_terminate == []
+
+        drain_input.draining_instance_ids = set()
+        reply = _schedule(
+            [_head(), _instance("r-1", available_cpu=0)],
+            drain_input,
+            resource_requests=[ResourceRequestUtil.make({"CPU": 4})],
+        )
+        assert [(r.instance_type, r.count) for r in reply.to_launch] == [("cpu", 1)]
+
+
 #########################################################################
 # UnderutilizedNodeDrainer
 #########################################################################
@@ -844,7 +931,15 @@ class FakeFetcher:
         self.actors_by_node: Dict[str, Dict] = {}
         self.stats: Dict[str, Optional[List[CoreWorkerStats]]] = {}
         self.node_states: Dict[str, NodeState] = {}
+        self.draining_deadlines: Dict[str, int] = {}
         self.fetched_node_ids: List[List[str]] = []
+        self.rpc_timeout_s = None
+
+    def set_rpc_timeout(self, rpc_timeout_s):
+        self.rpc_timeout_s = rpc_timeout_s
+
+    def fetch_draining_deadlines(self):
+        return self.draining_deadlines
 
     def fetch_alive_actors_by_node(self):
         return self.actors_by_node
@@ -933,11 +1028,33 @@ def test_drainer_prepare_candidates():
     assert drain_input.candidate_workloads == {}
     assert len(fetcher.fetched_node_ids) == 1
 
-    # Disabled: no candidates.
+    # The config is applied to the fetcher.
+    assert fetcher.rpc_timeout_s == config.rpc_timeout_s
+
+    # Disabled without any drain in progress: nothing is computed.
     clock.now_s += 100
-    disabled = UnderutilizedNodeDrainConfig.from_dict({"enabled": False})
+    disabled = UnderutilizedNodeDrainConfig.from_dict(
+        {"enabled": False, "rpc_timeout_s": 3}
+    )
     drain_input = drainer.prepare(disabled, ray_state, im_instances)
     assert drain_input.candidate_workloads == {}
+    assert drain_input.last_scale_up_s is None
+    assert fetcher.rpc_timeout_s == 3
+
+
+def test_drainer_counts_draining_nodes():
+    clock, fetcher, drainer, config, ray_state, im_instances = _drainer_setup()
+    # A node drained for another reason (or by this feature before an
+    # autoscaler restart) has no record, but still counts.
+    im_instances[1].status = Instance.RAY_STOPPING
+    im_instances[2].status = Instance.RAY_STOP_REQUESTED
+    im_instances.append(
+        create_instance("head", status=Instance.RAY_RUNNING, node_kind=NodeKind.HEAD)
+    )
+    drain_input = drainer.prepare(config, ray_state, im_instances)
+    assert drain_input.num_draining_nodes == 2
+    assert drain_input.num_worker_nodes == 5
+    assert drain_input.draining_instance_ids == set()
 
 
 def _drain_request(instance_id: str, ray_node_id: str) -> TerminationRequest:
@@ -953,6 +1070,7 @@ def _drain_request(instance_id: str, ray_node_id: str) -> TerminationRequest:
 
 def test_drainer_records_and_reservations():
     clock, fetcher, drainer, config, ray_state, im_instances = _drainer_setup()
+    drainer.prepare(config, ray_state, im_instances)
     clock.now_s += 200
     drainer.prepare(config, ray_state, im_instances)
     drainer.on_scheduled(
@@ -998,11 +1116,18 @@ def test_drainer_records_and_reservations():
     assert drain_input.reservation_requests == []
 
 
+def _select_r1_to_drain(clock, drainer, config, ray_state, im_instances):
+    # Start tracking the underutilization, then evaluate R1 as a candidate.
+    drainer.prepare(config, ray_state, im_instances)
+    clock.now_s += 200
+    drain_input = drainer.prepare(config, ray_state, im_instances)
+    assert drain_input.candidate_workloads[R1].complete
+    drainer.on_scheduled([_drain_request("i-1", R1)])
+
+
 def test_drainer_recheck():
     clock, fetcher, drainer, config, ray_state, im_instances = _drainer_setup()
-    clock.now_s += 200
-    drainer.prepare(config, ray_state, im_instances)
-    drainer.on_scheduled([_drain_request("i-1", R1)])
+    _select_r1_to_drain(clock, drainer, config, ray_state, im_instances)
     fetcher.node_states[R1] = _node_state(R1, 3)
     assert drainer.recheck("i-1") == (True, "")
 
@@ -1020,52 +1145,130 @@ def test_drainer_recheck():
     assert drainer.recheck("unknown") == (False, "no drain record")
 
 
-def test_drainer_instances_to_terminate():
+@pytest.mark.parametrize("change", ["new_actor", "more_resources", "pg", "none"])
+def test_drainer_recheck_workload_changed(change):
+    clock, fetcher, drainer, config, ray_state, im_instances = _drainer_setup()
+    _select_r1_to_drain(clock, drainer, config, ray_state, im_instances)
+    fetcher.node_states[R1] = _node_state(R1, 3)
+    if change == "new_actor":
+        # A new map worker landed on the node after the simulation.
+        fetcher.stats[R1].append(
+            _worker_stats(b"w2", actor_id=_actor_id(7), used={"CPU": 0.5})
+        )
+        fetcher.actors_by_node[R1] = {
+            _actor_id(7).hex(): _actor_data(_actor_id(7), required={"CPU": 0.5})
+        }
+    elif change == "more_resources":
+        fetcher.stats[R1] = [
+            _worker_stats(b"w1", num_running_tasks=1, used={"CPU": 1.5})
+        ]
+    elif change == "pg":
+        fetcher.node_states[R1] = _node_state(R1, 3, dynamic_labels={"_PG_x": ""})
+
+    ok, reason = drainer.recheck("i-1")
+    if change == "none":
+        assert ok, reason
+    else:
+        assert not ok
+        assert reason.startswith("pg" if change == "pg" else "workload_changed")
+
+
+def test_workload_growth_reason():
+    before = _workload(
+        "n", actors=[_actor("a1")], tasks=[RunningTask("w", 1, {"CPU": 1})]
+    )
+    # Tasks churn, but the total doesn't grow.
+    after = _workload(
+        "n",
+        actors=[_actor("a1")],
+        tasks=[RunningTask("x", 1, {"CPU": 0.5}), RunningTask("y", 1, {"CPU": 0.5})],
+    )
+    assert get_workload_growth_reason(before, after, 0.01) is None
+    after.tasks.append(RunningTask("z", 1, {"GPU": 1}))
+    assert get_workload_growth_reason(before, after, 0.01).startswith(
+        "workload_changed"
+    )
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_drainer_instances_to_terminate(enabled):
     clock = FakeClock(1000)
-    drainer = UnderutilizedNodeDrainer(None, clock=clock)
-    drainer.prepare(
+    fetcher = FakeFetcher()
+    drainer = UnderutilizedNodeDrainer(fetcher, clock=clock)
+    drainer.update_config(
         UnderutilizedNodeDrainConfig.from_dict(
             {
-                "enabled": True,
+                "enabled": enabled,
                 "termination_buffer_s": 30,
                 "drain_grace_period_s": 300,
-                "ray_stopping_timeout_s": 3600,
             }
-        ),
-        ClusterResourceState(),
-        [],
+        )
     )
-    with_deadline = create_instance("i-1", status=Instance.RAY_STOPPING)
-    without_deadline = create_instance("i-2", status=Instance.RAY_STOPPING)
-    unknown = create_instance("i-3", status=Instance.RAY_STOPPING)
-    for instance in (with_deadline, without_deadline):
+    instances = {
+        # Drained by this feature, deadline recorded.
+        "i-1": create_instance("i-1", status=Instance.RAY_STOPPING, ray_node_id="n1"),
+        # Drained by this feature, deadline not recorded: read from GCS.
+        "i-2": create_instance("i-2", status=Instance.RAY_STOPPING, ray_node_id="n2"),
+        # Drained by this feature, no deadline anywhere: grace period.
+        "i-3": create_instance("i-3", status=Instance.RAY_STOPPING, ray_node_id="n3"),
+        # No record (other drain, or lost on restart) with a deadline.
+        "i-4": create_instance("i-4", status=Instance.RAY_STOPPING, ray_node_id="n4"),
+        # No record, without a deadline (e.g. an idle termination).
+        "i-5": create_instance("i-5", status=Instance.RAY_STOPPING, ray_node_id="n5"),
+    }
+    for instance_id in ("i-1", "i-2", "i-3"):
         drainer.registry.add(
             DrainRecord(
-                instance_id=instance.instance_id,
-                ray_node_id="n",
+                instance_id=instance_id,
+                ray_node_id=instances[instance_id].node_id,
                 node_type="cpu",
-                workload=NodeWorkload(ray_node_id="n"),
+                workload=NodeWorkload(ray_node_id=instances[instance_id].node_id),
             )
         )
     drainer.on_drain_issued("i-1", deadline_ms=1100 * 1000)
-    since = {"i-1": 900, "i-2": 900, "i-3": 900}
+    fetcher.draining_deadlines = {"n2": 1200 * 1000, "n4": 1300 * 1000, "n5": 0}
 
     def terminate_at(now_s):
         clock.now_s = now_s
         return set(
             drainer.get_instances_to_terminate(
-                [with_deadline, without_deadline, unknown],
-                lambda instance: since[instance.instance_id],
+                list(instances.values()), lambda instance: 900
             )
         )
 
     assert terminate_at(1100) == set()
-    # Deadline + buffer.
     assert terminate_at(1131) == {"i-1"}
-    # RAY_STOPPING time + grace period + buffer.
-    assert terminate_at(1231) == {"i-1", "i-2"}
-    # Unknown drains: ray_stopping_timeout_s.
-    assert terminate_at(900 + 3601) == {"i-1", "i-2", "i-3"}
+    assert terminate_at(1231) == {"i-1", "i-2", "i-3"}
+    # Drains not issued by this feature are only forced when it's enabled, and
+    # never before their deadline.
+    others = {"i-4"} if enabled else set()
+    assert terminate_at(1331) == {"i-1", "i-2", "i-3"} | others
+    assert terminate_at(100000) == {"i-1", "i-2", "i-3"} | others
+
+
+def test_fetch_core_worker_stats_in_parallel():
+    gcs_client = mock.MagicMock()
+    gcs_client.get_all_node_info.return_value = {
+        node_id: mock.MagicMock(
+            node_id=bytes.fromhex(node_id),
+            node_manager_address="1.2.3.4",
+            node_manager_port=port,
+        )
+        for port, node_id in enumerate([R1, R2, R3])
+    }
+    fetcher = NodeWorkloadFetcher(gcs_client, rpc_timeout_s=1)
+
+    def get_node_stats(address, port):
+        if port == 1:
+            raise TimeoutError("timeout")
+        return [_worker_stats(b"w")]
+
+    with mock.patch.object(fetcher, "_get_node_stats", side_effect=get_node_stats):
+        stats = fetcher.fetch_core_worker_stats([R1, R2, R3, R4])
+    assert len(stats[R1]) == 1
+    assert stats[R2] is None  # Failed.
+    assert len(stats[R3]) == 1
+    assert stats[R4] is None  # Unknown node.
 
 
 #########################################################################
@@ -1098,7 +1301,8 @@ def _drainer_with_record(clock):
             instance_id="i-1",
             ray_node_id=R1,
             node_type="cpu",
-            workload=NodeWorkload(ray_node_id=R1),
+            # The workload when the node was selected.
+            workload=build_node_workload(R1, fetcher.stats[R1], {}, {}, 0.01, 1000),
         )
     )
     return fetcher, drainer

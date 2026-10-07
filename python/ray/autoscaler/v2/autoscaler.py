@@ -86,10 +86,7 @@ class Autoscaler:
         # Shared by the reconciler and the RayStopper. It's a no-op unless
         # `underutilized_node_drain` is enabled in the config.
         self._underutilized_drainer = UnderutilizedNodeDrainer(
-            NodeWorkloadFetcher(
-                gcs_client,
-                rpc_timeout_s=config.get_underutilized_node_drain_config().rpc_timeout_s,
-            )
+            NodeWorkloadFetcher(gcs_client)
         )
 
         self._init_cloud_instance_provider(config, config_reader)

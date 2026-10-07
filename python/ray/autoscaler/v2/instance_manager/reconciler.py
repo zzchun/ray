@@ -122,6 +122,15 @@ class Reconciler:
         ray_install_errors = ray_install_errors or []
         ray_stop_errors = ray_stop_errors or []
 
+        if underutilized_drainer is not None:
+            # Apply the latest config before any step uses the drainer.
+            try:
+                underutilized_drainer.update_config(
+                    autoscaling_config.get_underutilized_node_drain_config()
+                )
+            except Exception:
+                logger.exception("Invalid underutilized node drain config.")
+
         autoscaling_state = AutoscalingState()
         autoscaling_state.last_seen_cluster_resource_state_version = (
             ray_cluster_resource_state.cluster_resource_state_version

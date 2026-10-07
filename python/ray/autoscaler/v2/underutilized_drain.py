@@ -31,6 +31,7 @@ import math
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 
@@ -77,6 +78,18 @@ _ACTOR_DEFAULT_RESOURCE_KEYS = {"memory", "object_store_memory"}
 # Length of a binary ActorID. A nil ActorID is all 0xff bytes.
 _ACTOR_ID_SIZE = 16
 
+# Only the actors of Ray Data actor pools (map workers) can be moved for now.
+# By default they are restarted (max_restarts=-1) and retry their in-flight
+# methods (max_task_retries=-1), and Ray Data stops dispatching tasks to actors
+# on draining nodes. See
+# `ray.data._internal.execution.operators.actor_pool_map_operator`, where each
+# operator's worker class is named `MapWorker(<operator name>)`.
+RAY_DATA_MAP_WORKER_MODULE = (
+    "ray.data._internal.execution.operators.actor_pool_map_operator"
+)
+RAY_DATA_MAP_WORKER_CLASS_NAME = "_MapWorker"
+RAY_DATA_MAP_WORKER_CLASS_NAME_PREFIX = "MapWorker("
+
 
 def is_underutilized_drain_request(request: Optional[TerminationRequest]) -> bool:
     """Returns True if the termination request is an underutilized node drain."""
@@ -91,6 +104,14 @@ def is_workload_resource(resource_name: str) -> bool:
     """Returns True if the resource is used by tasks/actors' logical resources."""
     return resource_name not in _NON_WORKLOAD_RESOURCES and not any(
         resource_name.startswith(p) for p in _NON_WORKLOAD_RESOURCE_PREFIXES
+    )
+
+
+def is_ray_data_map_worker(module_name: str, class_name: str) -> bool:
+    """Returns True if the actor class is a Ray Data actor pool map worker."""
+    return module_name == RAY_DATA_MAP_WORKER_MODULE and (
+        class_name == RAY_DATA_MAP_WORKER_CLASS_NAME
+        or class_name.startswith(RAY_DATA_MAP_WORKER_CLASS_NAME_PREFIX)
     )
 
 
@@ -208,9 +229,6 @@ class UnderutilizedNodeDrainConfig:
     # Extra time to wait after the drain deadline before terminating the
     # instance, to tolerate clock skew between nodes.
     termination_buffer_s: float = 30
-    # Draining instances without a known deadline (e.g. after an autoscaler
-    # restart) are terminated after staying in RAY_STOPPING this long.
-    ray_stopping_timeout_s: float = 3600
     # Nodes with more running non-actor tasks are not drained.
     max_running_tasks_per_node: int = 10
     # Nodes with more actors are not drained.
@@ -242,7 +260,6 @@ class UnderutilizedNodeDrainConfig:
         "underutilized_duration_s",
         "drain_grace_period_s",
         "termination_buffer_s",
-        "ray_stopping_timeout_s",
         "max_object_store_used_bytes",
         "post_drain_max_utilization",
         "cooldown_after_scale_up_s",
@@ -390,6 +407,9 @@ class ActorOnNode:
     in_placement_group: bool
     max_restarts: int
     is_detached: bool
+    # The actor class name, and whether it's a Ray Data map worker.
+    class_name: str = ""
+    is_ray_data_map_worker: bool = False
     # The number of actor methods being executed.
     num_running_methods: int = 0
     # The number of actors / objects owned by the actor.
@@ -524,6 +544,11 @@ def build_node_workload(
             )
         seen_actor_ids.add(actor_id)
         required = {k: v for k, v in actor_data.required_resources.items() if v > 0}
+        module_name, class_name = "", actor_data.class_name
+        descriptor = actor_data.function_descriptor
+        if descriptor.WhichOneof("function_descriptor") == "python_function_descriptor":
+            module_name = descriptor.python_function_descriptor.module_name
+            class_name = descriptor.python_function_descriptor.class_name
         workload.actors.append(
             ActorOnNode(
                 actor_id=actor_id,
@@ -538,6 +563,8 @@ def build_node_workload(
                 ),
                 max_restarts=actor_data.max_restarts,
                 is_detached=actor_data.is_detached,
+                class_name=class_name,
+                is_ray_data_map_worker=is_ray_data_map_worker(module_name, class_name),
                 num_running_methods=stats.num_running_tasks,
                 num_owned_actors=stats.num_owned_actors,
                 num_owned_objects=stats.num_owned_objects,
@@ -602,6 +629,11 @@ def get_actor_skip_reason(
     actor: ActorOnNode, ray_node_id: str, config: UnderutilizedNodeDrainConfig
 ) -> Optional[str]:
     """Returns why the actor prevents draining its node, None if it doesn't."""
+    if not actor.is_ray_data_map_worker:
+        return (
+            f"actor {actor.actor_id} ({actor.class_name}) is not a Ray Data "
+            "map worker"
+        )
     if actor.max_restarts == 0:
         return f"actor {actor.actor_id} is not restartable (max_restarts=0)"
     if actor.in_placement_group:
@@ -648,6 +680,56 @@ def get_workload_skip_reason(
     return None
 
 
+def _total_requested_resources(workload: NodeWorkload) -> Dict[str, float]:
+    totals: Dict[str, float] = defaultdict(float)
+    for request in workload_to_resource_requests(workload):
+        for resource_name, amount in request.resources_bundle.items():
+            totals[resource_name] += amount
+    return totals
+
+
+def get_workload_growth_reason(
+    before: NodeWorkload, after: NodeWorkload, tolerance: float
+) -> Optional[str]:
+    """Returns why `after` may not fit where `before` was simulated to fit.
+
+    The feasibility simulation is done with `before`. If the workload got new
+    actors or needs more resources since, the simulation no longer holds.
+    """
+    new_actor_ids = {a.actor_id for a in after.actors} - {
+        a.actor_id for a in before.actors
+    }
+    if new_actor_ids:
+        return f"workload_changed: {len(new_actor_ids)} new actors on the node"
+    before_totals = _total_requested_resources(before)
+    for resource_name, amount in _total_requested_resources(after).items():
+        if amount > before_totals.get(resource_name, 0.0) + tolerance:
+            return (
+                f"workload_changed: needs {amount} {resource_name}, "
+                f"{before_totals.get(resource_name, 0.0)} when selected"
+            )
+    return None
+
+
+def get_node_state_skip_reason(
+    node_state: NodeState, config: UnderutilizedNodeDrainConfig
+) -> Optional[str]:
+    """Returns why the node shouldn't be drained based on its state only."""
+    if node_state.labels.get(DRAIN_PROTECTED_LABEL, "").lower() == "true":
+        return "drain_protected: the node is protected by its label"
+    if any(
+        label.startswith(PLACEMENT_GROUP_LABEL_PREFIX)
+        for label in node_state.dynamic_labels
+    ):
+        return "pg: placement group bundles are on the node"
+    object_store_used = node_state.total_resources.get(
+        "object_store_memory", 0.0
+    ) - node_state.available_resources.get("object_store_memory", 0.0)
+    if object_store_used > config.max_object_store_used_bytes:
+        return f"object_store: {object_store_used} bytes used"
+    return None
+
+
 @dataclass
 class UnderutilizedDrainInput:
     """The underutilized node drain inputs of one scheduling round."""
@@ -663,8 +745,14 @@ class UnderutilizedDrainInput:
     # Resource requests reserving capacity for the workloads of the nodes
     # being drained.
     reservation_requests: List[ResourceRequest] = field(default_factory=list)
-    # IM instance ids of the nodes being drained.
+    # IM instance ids of the nodes being drained for underutilization.
     draining_instance_ids: Set[str] = field(default_factory=set)
+    # The number of worker nodes being drained for any reason (counted against
+    # `max_concurrent_draining`), and the number of worker nodes running ray
+    # (the base of a percentage `max_concurrent_draining`). They come from the
+    # instance manager, so they survive autoscaler restarts unlike the records.
+    num_draining_nodes: int = 0
+    num_worker_nodes: int = 0
     # The last time an instance was queued to launch (seconds since epoch).
     last_scale_up_s: Optional[float] = None
 
@@ -719,7 +807,8 @@ class UnderutilizedDrainRegistry:
     """Thread-safe in-memory records of the nodes being drained.
 
     Like the instance manager's storage, it's lost on autoscaler restarts. The
-    reconciler then falls back to `ray_stopping_timeout_s`.
+    drain deadline is then read from GCS instead (see
+    `UnderutilizedNodeDrainer.get_instances_to_terminate`).
     """
 
     def __init__(self):
@@ -766,6 +855,15 @@ class NodeWorkloadFetcher:
         self._rpc_timeout_s = rpc_timeout_s
         self._lock = threading.Lock()
         self._stubs: Dict[str, Any] = {}
+
+    _MAX_PARALLEL_NODE_STATS = 8
+
+    def set_rpc_timeout(self, rpc_timeout_s: float) -> None:
+        self._rpc_timeout_s = rpc_timeout_s
+
+    def fetch_draining_deadlines(self) -> Dict[str, int]:
+        """Returns the drain deadline (unix ms, 0 if none) of draining nodes."""
+        return self._gcs_client.get_draining_nodes(timeout=self._rpc_timeout_s)
 
     def fetch_alive_actors_by_node(self) -> Dict[str, Dict[str, Any]]:
         """Returns the ALIVE actors keyed by hex node id and hex actor id."""
@@ -816,16 +914,32 @@ class NodeWorkloadFetcher:
             logger.exception("Failed to get node info for %s", ray_node_ids)
             return results
 
+        addresses = {}
         for node_info in node_infos.values():
             ray_node_id = binary_to_hex(node_info.node_id)
-            if ray_node_id not in results:
-                continue
-            try:
-                results[ray_node_id] = self._get_node_stats(
-                    node_info.node_manager_address, node_info.node_manager_port
+            if ray_node_id in results:
+                addresses[ray_node_id] = (
+                    node_info.node_manager_address,
+                    node_info.node_manager_port,
                 )
+
+        def _get(ray_node_id: str) -> Optional[List[Any]]:
+            try:
+                return self._get_node_stats(*addresses[ray_node_id])
             except Exception as e:
                 logger.warning(f"Failed to get node stats of {ray_node_id}: {e}")
+                return None
+
+        if not addresses:
+            return results
+        # Query the raylets in parallel, so that slow raylets don't add up.
+        with ThreadPoolExecutor(
+            max_workers=min(self._MAX_PARALLEL_NODE_STATS, len(addresses))
+        ) as executor:
+            for ray_node_id, stats in zip(
+                addresses, executor.map(_get, list(addresses))
+            ):
+                results[ray_node_id] = stats
         return results
 
     def _get_node_stats(self, address: str, port: int) -> List[Any]:
@@ -919,6 +1033,12 @@ class UnderutilizedNodeDrainer:
     def config(self) -> UnderutilizedNodeDrainConfig:
         return self._config
 
+    def update_config(self, config: UnderutilizedNodeDrainConfig) -> None:
+        """Applies the latest config. Called at the start of each round."""
+        self._config = config
+        if self._fetcher is not None:
+            self._fetcher.set_rpc_timeout(config.rpc_timeout_s)
+
     def prepare(
         self,
         config: UnderutilizedNodeDrainConfig,
@@ -935,18 +1055,34 @@ class UnderutilizedNodeDrainer:
         Returns:
             The inputs for `ResourceDemandScheduler`.
         """
-        self._config = config
+        self.update_config(config)
         now_s = self._clock()
-        ray_nodes = {binary_to_hex(n.node_id): n for n in ray_state.node_states}
         instances_by_id = {i.instance_id: i for i in im_instances}
 
         self._forget_finished_drains(instances_by_id)
         records = self._registry.records()
+        self._candidate_workloads = {}
+        if not config.enabled and not records:
+            # Nothing to do: skip scanning the instances and nodes.
+            self._tracker = UnderutilizationTracker()
+            return UnderutilizedDrainInput(config=config, now_s=now_s)
+
+        ray_nodes = {binary_to_hex(n.node_id): n for n in ray_state.node_states}
+        worker_instances = [i for i in im_instances if i.node_kind != NodeKind.HEAD]
         drain_input = UnderutilizedDrainInput(
             config=config,
             now_s=now_s,
             draining_instance_ids={r.instance_id for r in records},
             last_scale_up_s=self._get_last_scale_up_s(im_instances),
+            num_draining_nodes=sum(
+                1 for i in worker_instances if i.status in self._DRAINING_STATUSES
+            ),
+            num_worker_nodes=sum(
+                1
+                for i in worker_instances
+                if i.status == Instance.RAY_RUNNING
+                or i.status in self._DRAINING_STATUSES
+            ),
         )
 
         candidates: List[str] = []
@@ -966,7 +1102,6 @@ class UnderutilizedNodeDrainer:
             if r.ray_node_id in ray_nodes
             and ray_nodes[r.ray_node_id].status != NodeStatus.DEAD
         ]
-        self._candidate_workloads = {}
         if evaluate and (candidates or alive_records) and self._fetcher is not None:
             self._last_evaluation_s = now_s
             workloads = self._fetch_workloads(
@@ -1037,6 +1172,9 @@ class UnderutilizedNodeDrainer:
         utilization = _node_dominant_utilization(node_state)
         if utilization >= config.utilization_threshold:
             return False, f"the node is no longer underutilized: {utilization:.2f}"
+        reason = get_node_state_skip_reason(node_state, config)
+        if reason:
+            return False, reason
         workload = build_node_workload(
             record.ray_node_id,
             stats.get(record.ray_node_id),
@@ -1046,6 +1184,13 @@ class UnderutilizedNodeDrainer:
             self._clock(),
         )
         reason = get_workload_skip_reason(workload, config)
+        if reason:
+            return False, reason
+        # The node was selected by simulating the placement of its workload at
+        # the time. Don't drain it if the workload grew since.
+        reason = get_workload_growth_reason(
+            record.workload, workload, config.resource_reconcile_tolerance
+        )
         if reason:
             return False, reason
         self._registry.update_workload(instance_id, workload)
@@ -1065,6 +1210,12 @@ class UnderutilizedNodeDrainer:
     ) -> Dict[str, str]:
         """Returns the RAY_STOPPING instances to terminate, with the reasons.
 
+        An instance is terminated once its drain deadline (plus the
+        termination buffer) passes. The deadline comes from the drain record,
+        or from GCS if the record has none (e.g. lost on an autoscaler restart).
+        Drains without a deadline (e.g. idle terminations) are never forced, and
+        drains not started by this feature are only forced when it's enabled.
+
         Args:
             ray_stopping_instances: Instances in RAY_STOPPING.
             ray_stopping_since_s: Returns when an instance entered RAY_STOPPING.
@@ -1074,34 +1225,44 @@ class UnderutilizedNodeDrainer:
         """
         now_s = self._clock()
         config = self._config
+        gcs_deadlines: Optional[Dict[str, int]] = None
+
+        def _gcs_deadline_ms(ray_node_id: str) -> int:
+            nonlocal gcs_deadlines
+            if gcs_deadlines is None:
+                gcs_deadlines = {}
+                if self._fetcher is not None:
+                    try:
+                        gcs_deadlines = self._fetcher.fetch_draining_deadlines()
+                    except Exception as e:
+                        logger.warning(f"Failed to get the draining nodes: {e}")
+            return gcs_deadlines.get(ray_node_id, 0)
+
         to_terminate = {}
         for instance in ray_stopping_instances:
             record = self._registry.get(instance.instance_id)
-            if record is not None and record.drain_deadline_ms is not None:
-                terminate_at_s = (
-                    record.drain_deadline_ms / 1000 + config.termination_buffer_s
-                )
-                if now_s > terminate_at_s:
+            if record is None and not config.enabled:
+                continue
+            deadline_ms = record.drain_deadline_ms if record is not None else None
+            if not deadline_ms and instance.node_id:
+                deadline_ms = _gcs_deadline_ms(instance.node_id) or None
+
+            if deadline_ms:
+                if now_s > deadline_ms / 1000 + config.termination_buffer_s:
                     to_terminate[
                         instance.instance_id
-                    ] = "underutilized node drain deadline passed"
+                    ] = f"drain deadline {deadline_ms} passed"
             elif record is not None:
-                # The drain was accepted but the deadline isn't recorded yet.
-                since_s = ray_stopping_since_s(instance)
+                # Drained by this feature, but no deadline is known yet.
                 terminate_at_s = (
-                    since_s + config.drain_grace_period_s + config.termination_buffer_s
+                    ray_stopping_since_s(instance)
+                    + config.drain_grace_period_s
+                    + config.termination_buffer_s
                 )
                 if now_s > terminate_at_s:
                     to_terminate[
                         instance.instance_id
                     ] = "underutilized node drain grace period passed"
-            elif config.enabled:
-                since_s = ray_stopping_since_s(instance)
-                if now_s - since_s > config.ray_stopping_timeout_s:
-                    to_terminate[instance.instance_id] = (
-                        f"stuck in RAY_STOPPING for more than "
-                        f"{config.ray_stopping_timeout_s}s"
-                    )
         return to_terminate
 
     def _forget_finished_drains(self, instances_by_id: Dict[str, Instance]) -> None:
@@ -1154,17 +1315,7 @@ class UnderutilizedNodeDrainer:
                 or durations.get(ray_node_id, -1) < min_duration_ms
             ):
                 continue
-            if node_state.labels.get(DRAIN_PROTECTED_LABEL, "").lower() == "true":
-                continue
-            if any(
-                label.startswith(PLACEMENT_GROUP_LABEL_PREFIX)
-                for label in node_state.dynamic_labels
-            ):
-                continue
-            object_store_used = node_state.total_resources.get(
-                "object_store_memory", 0.0
-            ) - node_state.available_resources.get("object_store_memory", 0.0)
-            if object_store_used > config.max_object_store_used_bytes:
+            if get_node_state_skip_reason(node_state, config):
                 continue
             candidates.append(ray_node_id)
 

@@ -1021,8 +1021,23 @@ class ResourceDemandScheduler(IResourceScheduler):
                     and instance.im_instance.instance_id in draining_instance_ids
                 ):
                     # A node being drained for underutilization still runs its
-                    # workloads. Don't model it as an empty pending node (as
-                    # RAY_STOP_REQUESTED nodes are), nor let it host anything.
+                    # workloads until its deadline. Don't model it as an empty
+                    # pending node (as RAY_STOP_REQUESTED nodes are) that could
+                    # host anything, but keep counting it towards the max number
+                    # of nodes, like the outdated nodes being terminated.
+                    nodes.append(
+                        SchedulingNode(
+                            node_type=instance.im_instance.instance_type,
+                            total_resources={},
+                            available_resources={},
+                            labels={},
+                            status=SchedulingNodeStatus.TO_TERMINATE,
+                            im_instance_id=instance.im_instance.instance_id,
+                            im_instance_status=instance.im_instance.status,
+                            ray_node_id=instance.im_instance.node_id,
+                            node_kind=instance.im_instance.node_kind,
+                        )
+                    )
                     continue
                 node = SchedulingNode.new(
                     instance,
@@ -1753,56 +1768,14 @@ class ResourceDemandScheduler(IResourceScheduler):
                 scheduled.
             - List of infeasible requests remained that cannot be scheduled.
         """
-        # First sort the requests.
-        def _sort_resource_request(req: ResourceRequest) -> Tuple:
-            """
-            Sort the resource requests by:
-                1. The length of its placement constraints.
-                2. The length of its first label selector constraints (if any).
-                3. The number of resources it requests.
-                4. The values of resources it requests.
-                5. lexicographically for each resource (for stable ordering)
-
-            This is a legacy sorting function for the autoscaler's binpacking
-            algo - we do this so that we could have a deterministic scheduling
-            results with reasonable fragmentation.
-            """
-            label_constraint_len = (
-                len(req.label_selectors[0].label_constraints)
-                if req.label_selectors
-                else 0
-            )
-            return (
-                len(req.placement_constraints),
-                label_constraint_len,
-                len(req.resources_bundle.values()),
-                sum(req.resources_bundle.values()),
-                sorted(req.resources_bundle.items()),
-            )
-
-        requests_to_sched = sorted(
-            requests_to_sched, key=_sort_resource_request, reverse=True
-        )
-
-        # Precompute serialization keys to avoid redundant SerializeToString
-        # calls inside the per-node try_schedule loop.
-        shape_keys = {}
-        for r in requests_to_sched:
-            # Skip re-serializing the same object, e.g. from [r.request] * r.count.
-            if id(r) not in shape_keys:
-                shape_keys[id(r)] = r.SerializeToString(deterministic=True)
-
-        # Precompute unique resource shapes from all requests for quick
-        # feasibility pre-checks (AND within each shape, OR across shapes).
-        resource_shapes = _collect_unique_resource_shapes(requests_to_sched)
+        (
+            requests_to_sched,
+            shape_keys,
+            resource_shapes,
+        ) = ResourceDemandScheduler._prepare_requests_to_sched(requests_to_sched)
 
         existing_nodes = ctx.get_nodes()
         node_type_available = ctx.get_node_type_available()
-
-        # A list of nodes that are either:
-        #   1. existing nodes in the cluster. or
-        #   2. new nodes that are launched to satisfy the resource requests.
-        target_nodes = []
 
         for node in existing_nodes:
             if node.ippr_status is not None:
@@ -1816,46 +1789,22 @@ class ResourceDemandScheduler(IResourceScheduler):
                         }
                     )
 
-        # Pre-filter: skip RAY_RUNNING nodes that definitely cannot fit any
-        # request, avoiding expensive deepcopy + try_schedule in _sched_best_node.
-        exhausted_nodes = []
-        schedulable_nodes = []
-        for node in existing_nodes:
-            if (
-                node.im_instance_status == Instance.RAY_RUNNING
-                and not _can_fit_any_request(
-                    node.get_available_resources(resource_request_source),
-                    resource_shapes,
-                )
-            ):
-                exhausted_nodes.append(node)
-            else:
-                schedulable_nodes.append(node)
-        existing_nodes = schedulable_nodes
-
         # Try scheduling resource requests with existing nodes first.
-        while len(requests_to_sched) > 0 and len(existing_nodes) > 0:
-            (
-                best_node,
-                requests_to_sched,
-                existing_nodes,
-            ) = ResourceDemandScheduler._sched_best_node(
-                requests_to_sched,
-                existing_nodes,
-                resource_request_source,
-                ctx.get_cloud_resource_availabilities(),
-                ctx.get_recoverable_resource_availabilities(),
-                shape_keys,
-            )
-            if best_node is None:
-                # No existing nodes can schedule any more requests.
-                break
-
-            target_nodes.append(best_node)
-
-        # If there's any existing nodes left, we will add to the target nodes
-        target_nodes.extend(existing_nodes)
-        target_nodes.extend(exhausted_nodes)
+        # `target_nodes` is the list of nodes that are either:
+        #   1. existing nodes in the cluster. or
+        #   2. new nodes that are launched to satisfy the resource requests.
+        (
+            target_nodes,
+            requests_to_sched,
+        ) = ResourceDemandScheduler._sched_on_existing_nodes(
+            requests_to_sched,
+            existing_nodes,
+            resource_request_source,
+            ctx.get_cloud_resource_availabilities(),
+            ctx.get_recoverable_resource_availabilities(),
+            shape_keys,
+            resource_shapes,
+        )
 
         # Try scheduling remaining requests with IPPR after filling up existing nodes with their current capacity.
         existing_nodes = target_nodes
@@ -1973,6 +1922,134 @@ class ResourceDemandScheduler(IResourceScheduler):
             if node_type_available[best_node.node_type] > 0:
                 node_pools.append(_to_launch_node_with_ippr_caps(best_node.node_type))
 
+        return target_nodes, requests_to_sched
+
+    @staticmethod
+    def _prepare_requests_to_sched(
+        requests: List[ResourceRequest],
+    ) -> Tuple[List[ResourceRequest], Dict[int, bytes], List[Dict[str, float]]]:
+        """
+        Sort the requests for scheduling, and precompute their shape keys and
+        unique resource shapes.
+
+        Args:
+            requests: The resource requests to schedule.
+
+        Returns:
+            - The sorted requests.
+            - The serialization key of each request, keyed by id(request).
+            - The unique resource shapes of the requests.
+        """
+
+        def _sort_resource_request(req: ResourceRequest) -> Tuple:
+            """
+            Sort the resource requests by:
+                1. The length of its placement constraints.
+                2. The length of its first label selector constraints (if any).
+                3. The number of resources it requests.
+                4. The values of resources it requests.
+                5. lexicographically for each resource (for stable ordering)
+
+            This is a legacy sorting function for the autoscaler's binpacking
+            algo - we do this so that we could have a deterministic scheduling
+            results with reasonable fragmentation.
+            """
+            label_constraint_len = (
+                len(req.label_selectors[0].label_constraints)
+                if req.label_selectors
+                else 0
+            )
+            return (
+                len(req.placement_constraints),
+                label_constraint_len,
+                len(req.resources_bundle.values()),
+                sum(req.resources_bundle.values()),
+                sorted(req.resources_bundle.items()),
+            )
+
+        requests = sorted(requests, key=_sort_resource_request, reverse=True)
+
+        # Precompute serialization keys to avoid redundant SerializeToString
+        # calls inside the per-node try_schedule loop.
+        shape_keys = {}
+        for r in requests:
+            # Skip re-serializing the same object, e.g. from [r.request] * r.count.
+            if id(r) not in shape_keys:
+                shape_keys[id(r)] = r.SerializeToString(deterministic=True)
+
+        # Precompute unique resource shapes from all requests for quick
+        # feasibility pre-checks (AND within each shape, OR across shapes).
+        resource_shapes = _collect_unique_resource_shapes(requests)
+        return requests, shape_keys, resource_shapes
+
+    @staticmethod
+    def _sched_on_existing_nodes(
+        requests_to_sched: List[ResourceRequest],
+        existing_nodes: List[SchedulingNode],
+        resource_request_source: ResourceRequestSource,
+        cloud_resource_availabilities: Dict[NodeType, float],
+        recoverable_resource_availabilities: Dict[NodeType, float],
+        shape_keys: Dict[int, bytes],
+        resource_shapes: List[Dict[str, float]],
+    ) -> Tuple[List[SchedulingNode], List[ResourceRequest]]:
+        """
+        Bin-pack the requests onto the existing nodes, without launching new
+        nodes.
+
+        Args:
+            requests_to_sched: The requests, sorted by `_prepare_requests_to_sched`.
+            existing_nodes: The nodes to schedule the requests on.
+            resource_request_source: The source of the resource requests.
+            cloud_resource_availabilities: The cloud resource availability scores.
+            recoverable_resource_availabilities: The recoverable cloud resource
+                availability scores.
+            shape_keys: The serialization key of each request.
+            resource_shapes: The unique resource shapes of the requests.
+
+        Returns:
+            - All the nodes after scheduling.
+            - The requests that couldn't be scheduled.
+        """
+        # Pre-filter: skip RAY_RUNNING nodes that definitely cannot fit any
+        # request, avoiding expensive deepcopy + try_schedule in _sched_best_node.
+        exhausted_nodes = []
+        schedulable_nodes = []
+        for node in existing_nodes:
+            if (
+                node.im_instance_status == Instance.RAY_RUNNING
+                and not _can_fit_any_request(
+                    node.get_available_resources(resource_request_source),
+                    resource_shapes,
+                )
+            ):
+                exhausted_nodes.append(node)
+            else:
+                schedulable_nodes.append(node)
+        existing_nodes = schedulable_nodes
+
+        target_nodes = []
+        while len(requests_to_sched) > 0 and len(existing_nodes) > 0:
+            (
+                best_node,
+                requests_to_sched,
+                existing_nodes,
+            ) = ResourceDemandScheduler._sched_best_node(
+                requests_to_sched,
+                existing_nodes,
+                resource_request_source,
+                cloud_resource_availabilities,
+                recoverable_resource_availabilities,
+                shape_keys,
+            )
+            if best_node is None:
+                # No existing nodes can schedule any more requests.
+                break
+
+            target_nodes.append(best_node)
+
+        # If there's any existing nodes left, we will add to the target nodes
+        target_nodes.extend(existing_nodes)
+        target_nodes.extend(exhausted_nodes)
         return target_nodes, requests_to_sched
 
     @staticmethod
@@ -2298,16 +2375,11 @@ class ResourceDemandScheduler(IResourceScheduler):
             return
 
         nodes = ctx.get_nodes()
-        num_draining = len(drain_input.draining_instance_ids)
-        num_worker_nodes = num_draining + sum(
-            1
-            for node in nodes
-            if node.node_kind != NodeKind.HEAD
-            and node.status != SchedulingNodeStatus.TO_TERMINATE
-        )
+        num_draining = drain_input.num_draining_nodes
         quota = min(
             config.max_nodes_per_round,
-            config.get_max_concurrent_draining(num_worker_nodes) - num_draining,
+            config.get_max_concurrent_draining(drain_input.num_worker_nodes)
+            - num_draining,
         )
         if quota <= 0:
             for ray_node_id in candidate_ids:
@@ -2401,10 +2473,21 @@ class ResourceDemandScheduler(IResourceScheduler):
             }
             requests = workload_to_resource_requests(workload)
             (
+                sorted_requests,
+                shape_keys,
+                resource_shapes,
+            ) = ResourceDemandScheduler._prepare_requests_to_sched(requests)
+            (
                 trial_hosts,
                 infeasible,
-            ) = ResourceDemandScheduler._schedule_on_existing_nodes(
-                trial_hosts, requests
+            ) = ResourceDemandScheduler._sched_on_existing_nodes(
+                sorted_requests,
+                trial_hosts,
+                ResourceRequestSource.PENDING_DEMAND,
+                cloud_resource_availabilities={},
+                recoverable_resource_availabilities={},
+                shape_keys=shape_keys,
+                resource_shapes=resource_shapes,
             )
             if infeasible:
                 _log_skip(
@@ -2496,49 +2579,3 @@ class ResourceDemandScheduler(IResourceScheduler):
                 0.0, min(current, total * max_utilization - used)
             )
         return node
-
-    @staticmethod
-    def _schedule_on_existing_nodes(
-        nodes: List[SchedulingNode],
-        requests: List[ResourceRequest],
-    ) -> Tuple[List[SchedulingNode], List[ResourceRequest]]:
-        """
-        Bin-pack the requests onto the given nodes only (no new nodes).
-
-        Args:
-            nodes: The nodes to schedule the requests on.
-            requests: The requests to schedule.
-
-        Returns:
-            - The nodes after scheduling.
-            - The requests that couldn't be scheduled.
-        """
-        # Larger (and GPU) requests first, for a better packing.
-        requests = sorted(
-            requests,
-            key=lambda r: (
-                r.resources_bundle.get("GPU", 0),
-                len(r.label_selectors),
-                len(r.resources_bundle),
-                sum(r.resources_bundle.values()),
-            ),
-            reverse=True,
-        )
-        scheduled_nodes = []
-        remaining_nodes = list(nodes)
-        while requests and remaining_nodes:
-            (
-                best_node,
-                requests,
-                remaining_nodes,
-            ) = ResourceDemandScheduler._sched_best_node(
-                requests,
-                remaining_nodes,
-                ResourceRequestSource.PENDING_DEMAND,
-                cloud_resource_availabilities={},
-                recoverable_resource_availabilities={},
-            )
-            if best_node is None:
-                break
-            scheduled_nodes.append(best_node)
-        return scheduled_nodes + remaining_nodes, requests

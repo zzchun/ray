@@ -59,7 +59,6 @@
                 },
                 "drain_grace_period_s": {"type": "number", "minimum": 0},
                 "termination_buffer_s": {"type": "number", "minimum": 0},
-                "ray_stopping_timeout_s": {"type": "number", "minimum": 0},
                 "max_running_tasks_per_node": {"type": "integer", "minimum": 0},
                 "max_actors_per_node": {"type": "integer", "minimum": 0},
                 "max_object_store_used_bytes": {"type": "number", "minimum": 0},
