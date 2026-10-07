@@ -2,12 +2,16 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from queue import Queue
-from typing import List
+from typing import List, Optional
 
 from ray._common.utils import hex_to_binary
 from ray._raylet import GcsClient
 from ray.autoscaler.v2.instance_manager.instance_manager import (
     InstanceUpdatedSubscriber,
+)
+from ray.autoscaler.v2.underutilized_drain import (
+    UnderutilizedNodeDrainer,
+    is_underutilized_drain_request,
 )
 from ray.core.generated.autoscaler_pb2 import DrainNodeReason
 from ray.core.generated.instance_manager_pb2 import (
@@ -29,6 +33,8 @@ class RayStopper(InstanceUpdatedSubscriber):
     """RayStopper is responsible for stopping ray on instances.
 
     It will drain the ray node if it's for idle termination.
+    For underutilized node drains, it will drain the ray node with the
+    PREEMPTION reason and a deadline, after rechecking the node's workload.
     For other terminations, it will stop the ray node. (e.g. scale down, etc.)
 
     If any failures happen when stopping/draining the node, we will not retry
@@ -39,9 +45,15 @@ class RayStopper(InstanceUpdatedSubscriber):
 
     """
 
-    def __init__(self, gcs_client: GcsClient, error_queue: Queue) -> None:
+    def __init__(
+        self,
+        gcs_client: GcsClient,
+        error_queue: Queue,
+        underutilized_drainer: Optional[UnderutilizedNodeDrainer] = None,
+    ) -> None:
         self._gcs_client = gcs_client
         self._error_queue = error_queue
+        self._underutilized_drainer = underutilized_drainer
         self._executor = ThreadPoolExecutor(max_workers=1)
 
     def notify(self, events: List[InstanceUpdateEvent]) -> None:
@@ -66,6 +78,10 @@ class RayStopper(InstanceUpdatedSubscriber):
         ray_node_id = termination_request.ray_node_id
         instance_id = event.instance_id
 
+        if is_underutilized_drain_request(termination_request):
+            self._drain_underutilized_node(ray_node_id, instance_id)
+            return
+
         if termination_request.cause == TerminationRequest.Cause.IDLE:
             reason = DrainNodeReason.DRAIN_NODE_REASON_IDLE_TERMINATION
             reason_str = "Termination of node that's idle for {} seconds.".format(
@@ -86,6 +102,50 @@ class RayStopper(InstanceUpdatedSubscriber):
             self._gcs_client, self._error_queue, ray_node_id, instance_id
         )
 
+    def _drain_underutilized_node(self, ray_node_id: str, instance_id: str) -> None:
+        """
+        Drains an underutilized node with the PREEMPTION reason and a deadline.
+
+        The PREEMPTION reason makes the drain non-rejectable for a busy node,
+        marks its actors as preempted (so their restarts don't count towards
+        max_restarts), and makes the node death after the deadline count as a
+        preemption (so task retries don't count towards max_retries).
+
+        This never stops ray with `drain_nodes`: the node death would then not
+        be considered a preemption.
+        """
+        drainer = self._underutilized_drainer
+        if drainer is None:
+            logger.error(
+                f"Can't drain underutilized node {ray_node_id} without a drainer."
+            )
+            self._error_queue.put_nowait(RayStopError(im_instance_id=instance_id))
+            return
+
+        ok, reason = drainer.recheck(instance_id)
+        if not ok:
+            logger.info(f"Not draining underutilized node {ray_node_id}: {reason}")
+            drainer.forget(instance_id)
+            self._error_queue.put_nowait(RayStopError(im_instance_id=instance_id))
+            return
+
+        deadline_ms = drainer.get_drain_deadline_ms()
+        record = drainer.registry.get(instance_id)
+        accepted = self._drain_ray_node(
+            self._gcs_client,
+            self._error_queue,
+            ray_node_id,
+            instance_id,
+            DrainNodeReason.DRAIN_NODE_REASON_PREEMPTION,
+            "[autoscaler] underutilized node drain: "
+            + (record.workload.summary() if record else ""),
+            deadline_timestamp_ms=deadline_ms,
+        )
+        if accepted:
+            drainer.on_drain_issued(instance_id, deadline_ms)
+        else:
+            drainer.forget(instance_id)
+
     @staticmethod
     def _drain_ray_node(
         gcs_client: GcsClient,
@@ -94,7 +154,8 @@ class RayStopper(InstanceUpdatedSubscriber):
         instance_id: str,
         reason: DrainNodeReason,
         reason_str: str,
-    ):
+        deadline_timestamp_ms: int = 0,
+    ) -> bool:
         """
         Drains the ray node.
 
@@ -105,15 +166,17 @@ class RayStopper(InstanceUpdatedSubscriber):
             instance_id: The instance id corresponding to the ray node.
             reason: The reason to drain the node.
             reason_str: The reason message to drain the node.
+            deadline_timestamp_ms: The drain deadline, 0 for no deadline.
+
+        Returns:
+            Whether the drain is accepted.
         """
         try:
             accepted, reject_msg_str = gcs_client.drain_node(
                 node_id=ray_node_id,
                 reason=reason,
                 reason_message=reason_str,
-                # TODO: we could probably add a deadline here that's derived
-                # from the stuck instance reconciliation configs.
-                deadline_timestamp_ms=0,
+                deadline_timestamp_ms=deadline_timestamp_ms,
             )
             logger.info(
                 f"Drained ray on {ray_node_id}(success={accepted}, "
@@ -121,9 +184,11 @@ class RayStopper(InstanceUpdatedSubscriber):
             )
             if not accepted:
                 error_queue.put_nowait(RayStopError(im_instance_id=instance_id))
+            return accepted
         except Exception:
             logger.exception(f"Error draining ray on {ray_node_id}")
             error_queue.put_nowait(RayStopError(im_instance_id=instance_id))
+            return False
 
     @staticmethod
     def _stop_ray_node(

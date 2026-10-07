@@ -28,6 +28,7 @@ from ray.autoscaler._private.util import (
 )
 from ray.autoscaler.v2.schema import NodeType
 from ray.autoscaler.v2.sdk import get_cluster_resource_state
+from ray.autoscaler.v2.underutilized_drain import UnderutilizedNodeDrainConfig
 from ray.autoscaler.v2.utils import is_head_node
 
 logger = logging.getLogger(__name__)
@@ -175,6 +176,8 @@ class AutoscalingConfig:
     def update_configs(self, configs: Dict[str, Any], skip_content_hash: bool) -> None:
         self._configs = prepare_config(configs)
         validate_config(self._configs)
+        # Fail fast on an invalid underutilized node drain config.
+        self.get_underutilized_node_drain_config()
         if skip_content_hash:
             return
         self._calculate_hashes()
@@ -402,6 +405,36 @@ class AutoscalingConfig:
         """
         idle_timeout_s = self.get_config("idle_timeout_minutes", None)
         return idle_timeout_s * 60 if idle_timeout_s is not None else None
+
+    def get_underutilized_node_drain_config(self) -> UnderutilizedNodeDrainConfig:
+        """
+        Returns the config of the underutilized node drain from the top level
+        `underutilized_node_drain` field. A node type can opt out with
+        `available_node_types.<type>.underutilized_node_drain.enabled: false`.
+
+        Returns:
+            The underutilized node drain config, disabled if not configured.
+
+        Raises:
+            ValueError: If the config is invalid.
+        """
+        disabled_node_types = set()
+        for node_type, node_config in self._configs.get(
+            "available_node_types", {}
+        ).items():
+            node_type_drain_config = node_config.get("underutilized_node_drain") or {}
+            unknown = set(node_type_drain_config) - {"enabled"}
+            if unknown:
+                raise ValueError(
+                    f"Unknown underutilized_node_drain config keys of node type "
+                    f"{node_type}: {sorted(unknown)}"
+                )
+            if node_type_drain_config.get("enabled", True) is False:
+                disabled_node_types.add(node_type)
+        return UnderutilizedNodeDrainConfig.from_dict(
+            self._configs.get("underutilized_node_drain"),
+            disabled_node_types=disabled_node_types,
+        )
 
     def disable_launch_config_check(self) -> bool:
         provider_config = self.get_provider_config()

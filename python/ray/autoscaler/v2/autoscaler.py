@@ -42,6 +42,10 @@ from ray.autoscaler.v2.instance_manager.subscribers.threaded_ray_installer impor
 from ray.autoscaler.v2.metrics_reporter import AutoscalerMetricsReporter
 from ray.autoscaler.v2.scheduler import ResourceDemandScheduler
 from ray.autoscaler.v2.sdk import get_cluster_resource_state
+from ray.autoscaler.v2.underutilized_drain import (
+    NodeWorkloadFetcher,
+    UnderutilizedNodeDrainer,
+)
 from ray.core.generated.autoscaler_pb2 import AutoscalingState
 from ray.exceptions import AuthenticationError
 
@@ -79,6 +83,14 @@ class Autoscaler:
         self._ray_install_errors_queue = Queue()
         self._event_logger = event_logger
         self._metrics_reporter = metrics_reporter
+        # Shared by the reconciler and the RayStopper. It's a no-op unless
+        # `underutilized_node_drain` is enabled in the config.
+        self._underutilized_drainer = UnderutilizedNodeDrainer(
+            NodeWorkloadFetcher(
+                gcs_client,
+                rpc_timeout_s=config.get_underutilized_node_drain_config().rpc_timeout_s,
+            )
+        )
 
         self._init_cloud_instance_provider(config, config_reader)
         self._cloud_resource_monitor = None
@@ -148,7 +160,11 @@ class Autoscaler:
             )
         )
         subscribers.append(
-            RayStopper(gcs_client=gcs_client, error_queue=self._ray_stop_errors_queue)
+            RayStopper(
+                gcs_client=gcs_client,
+                error_queue=self._ray_stop_errors_queue,
+                underutilized_drainer=self._underutilized_drainer,
+            )
         )
         if not config.disable_node_updaters() and isinstance(
             cloud_provider, NodeProviderAdapter
@@ -225,6 +241,7 @@ class Autoscaler:
                 ray_stop_errors=ray_stop_errors,
                 autoscaling_config=autoscaling_config,
                 metrics_reporter=self._metrics_reporter,
+                underutilized_drainer=self._underutilized_drainer,
             )
         except AuthenticationError as e:
             logger.warning(f"AuthenticationError detected, restarting autoscaler: {e}")

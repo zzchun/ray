@@ -26,6 +26,14 @@ from ray.autoscaler.v2.schema import (
     IPPRStatus,
     NodeType,
 )
+from ray.autoscaler.v2.underutilized_drain import (
+    UNDERUTILIZED_DRAIN_DETAILS_PREFIX,
+    NodeWorkload,
+    UnderutilizedDrainInput,
+    get_workload_skip_reason,
+    is_workload_resource,
+    workload_to_resource_requests,
+)
 from ray.autoscaler.v2.utils import ProtobufUtil, ResourceRequestUtil
 from ray.core.generated.autoscaler_pb2 import (
     ClusterResourceConstraint,
@@ -86,6 +94,9 @@ class SchedulingRequest:
     ippr_specs: Optional[IPPRSpecs] = None
     # Latest per-pod IPPR statuses keyed by cloud_instance_id (pod name).
     ippr_statuses: Dict[str, IPPRStatus] = field(default_factory=dict)
+
+    # Inputs of the underutilized node drain. None if not applicable.
+    underutilized_drain: Optional[UnderutilizedDrainInput] = None
 
 
 @dataclass
@@ -997,9 +1008,22 @@ class ResourceDemandScheduler(IResourceScheduler):
 
             nodes = []
             node_type_configs = req.node_type_configs
+            draining_instance_ids = (
+                req.underutilized_drain.draining_instance_ids
+                if req.underutilized_drain
+                else set()
+            )
 
             # Initialize the scheduling nodes.
             for instance in req.current_instances:
+                if (
+                    instance.im_instance is not None
+                    and instance.im_instance.instance_id in draining_instance_ids
+                ):
+                    # A node being drained for underutilization still runs its
+                    # workloads. Don't model it as an empty pending node (as
+                    # RAY_STOP_REQUESTED nodes are), nor let it host anything.
+                    continue
                 node = SchedulingNode.new(
                     instance,
                     node_type_configs,
@@ -1231,15 +1255,34 @@ class ResourceDemandScheduler(IResourceScheduler):
             )
         )
 
-        # Schedule the tasks/actor resource requests
+        # Schedule the tasks/actor resource requests, together with the requests
+        # reserving capacity for the workloads of the nodes being drained for
+        # underutilization.
+        reservation_requests = (
+            request.underutilized_drain.reservation_requests
+            if request.underutilized_drain
+            else []
+        )
         infeasible_requests = ResourceDemandScheduler._sched_resource_requests(
             ctx,
-            ResourceRequestUtil.ungroup_by_count(request.resource_requests),
+            ResourceRequestUtil.ungroup_by_count(request.resource_requests)
+            + list(reservation_requests),
         )
+        if reservation_requests:
+            # Reservations are not demands of the ray cluster.
+            reservation_request_ids = {id(r) for r in reservation_requests}
+            infeasible_requests = [
+                r for r in infeasible_requests if id(r) not in reservation_request_ids
+            ]
 
         # Shutdown any idle nodes that's not needed (e.g. no resource constraints.
         # not needed by min_worker count, etc.)
         ResourceDemandScheduler._enforce_idle_termination(ctx)
+
+        # Drain underutilized nodes whose workloads fit on the remaining nodes.
+        ResourceDemandScheduler._enforce_underutilized_drain(
+            ctx, request.underutilized_drain
+        )
 
         cluster_resources = ctx.get_cluster_resources()
 
@@ -2202,3 +2245,300 @@ class ResourceDemandScheduler(IResourceScheduler):
             )
 
         ctx.update(nodes)
+
+    @staticmethod
+    def _enforce_underutilized_drain(
+        ctx: "ResourceDemandScheduler.ScheduleContext",
+        drain_input: Optional[UnderutilizedDrainInput],
+    ) -> None:
+        """
+        Drain the underutilized worker nodes whose workloads fit on the
+        remaining running nodes.
+
+        The candidates and their workloads (actors and running tasks) are
+        collected by `ray.autoscaler.v2.underutilized_drain`. A candidate is
+        drained only if:
+            1. It isn't needed by the pending demands or resource constraints
+               scheduled in this round, and the cluster isn't scaling up.
+            2. Its workload is complete, small enough and restartable.
+            3. Its workload can be bin-packed onto the remaining running nodes,
+               without pushing any of their resources above
+               `post_drain_max_utilization`.
+
+        Candidates with less running work are tried first.
+
+        Args:
+            ctx: The schedule context.
+            drain_input: The underutilized node drain inputs of this round.
+        """
+        if (
+            drain_input is None
+            or not drain_input.config.enabled
+            or not drain_input.candidate_workloads
+        ):
+            return
+
+        config = drain_input.config
+        candidate_ids = list(drain_input.candidate_workloads)
+
+        def _log_skip(ray_node_id: str, reason: str) -> None:
+            logger.info(f"Not draining underutilized node {ray_node_id}: {reason}")
+
+        if ctx.get_launch_requests():
+            for ray_node_id in candidate_ids:
+                _log_skip(ray_node_id, "scale_up: the cluster is scaling up")
+            return
+        if (
+            drain_input.last_scale_up_s is not None
+            and drain_input.now_s - drain_input.last_scale_up_s
+            < config.cooldown_after_scale_up_s
+        ):
+            for ray_node_id in candidate_ids:
+                _log_skip(ray_node_id, "cooldown: the cluster scaled up recently")
+            return
+
+        nodes = ctx.get_nodes()
+        num_draining = len(drain_input.draining_instance_ids)
+        num_worker_nodes = num_draining + sum(
+            1
+            for node in nodes
+            if node.node_kind != NodeKind.HEAD
+            and node.status != SchedulingNodeStatus.TO_TERMINATE
+        )
+        quota = min(
+            config.max_nodes_per_round,
+            config.get_max_concurrent_draining(num_worker_nodes) - num_draining,
+        )
+        if quota <= 0:
+            for ray_node_id in candidate_ids:
+                _log_skip(
+                    ray_node_id,
+                    f"quota: {num_draining} nodes are being drained already",
+                )
+            return
+
+        candidates: List[Tuple[SchedulingNode, NodeWorkload]] = []
+        for node in nodes:
+            workload = drain_input.candidate_workloads.get(node.ray_node_id)
+            if not node.ray_node_id or workload is None:
+                continue
+            reason = ResourceDemandScheduler._get_underutilized_drain_skip_reason(
+                node, workload, drain_input
+            )
+            if reason:
+                _log_skip(node.ray_node_id, reason)
+                continue
+            candidates.append((node, workload))
+
+        def _sort_key(candidate: Tuple[SchedulingNode, NodeWorkload]) -> Tuple:
+            node, workload = candidate
+            num_running = (
+                workload.num_running_tasks + workload.num_running_actor_methods
+            )
+            return (
+                num_running + len(workload.actors),
+                num_running,
+                len(workload.actors),
+                workload.object_store_used_bytes,
+                drain_input.node_utilization.get(node.ray_node_id, 1.0),
+                -drain_input.underutilized_duration_ms.get(node.ray_node_id, 0),
+            )
+
+        candidates.sort(key=_sort_key)
+
+        # The running nodes that can host the drained workloads, with their
+        # available resources capped by `post_drain_max_utilization`.
+        hosts = [
+            ResourceDemandScheduler._with_capped_headroom(
+                node, config.post_drain_max_utilization
+            )
+            for node in nodes
+            if node.status == SchedulingNodeStatus.SCHEDULABLE
+            and node.im_instance_status == Instance.RAY_RUNNING
+            and node.ray_node_id
+        ]
+        count_by_type = ctx.get_cluster_shape()
+        node_type_configs = ctx.get_node_type_configs()
+        drained_by_type: Dict[NodeType, int] = defaultdict(int)
+        # Nodes that received the workloads of a node selected to drain.
+        receiving_node_ids = set()
+        num_selected = 0
+
+        for node, workload in candidates:
+            if num_selected >= quota:
+                _log_skip(node.ray_node_id, f"quota: {quota} nodes per round")
+                continue
+            if node.ray_node_id in receiving_node_ids:
+                _log_skip(
+                    node.ray_node_id,
+                    "hosting the workloads of another node being drained",
+                )
+                continue
+            min_count = (
+                node_type_configs[node.node_type].min_worker_nodes
+                if node.node_type in node_type_configs
+                else 0
+            )
+            if (
+                count_by_type.get(node.node_type, 0)
+                - drained_by_type[node.node_type]
+                - 1
+                < min_count
+            ):
+                _log_skip(node.ray_node_id, "min_worker_nodes")
+                continue
+
+            trial_hosts = [
+                copy.deepcopy(host)
+                for host in hosts
+                if host.ray_node_id != node.ray_node_id
+            ]
+            num_requests_before = {
+                host.ray_node_id: len(
+                    host.get_sched_requests(ResourceRequestSource.PENDING_DEMAND)
+                )
+                for host in trial_hosts
+            }
+            requests = workload_to_resource_requests(workload)
+            (
+                trial_hosts,
+                infeasible,
+            ) = ResourceDemandScheduler._schedule_on_existing_nodes(
+                trial_hosts, requests
+            )
+            if infeasible:
+                _log_skip(
+                    node.ray_node_id,
+                    f"infeasible: {len(infeasible)} of {len(requests)} resource "
+                    "requests don't fit on the remaining nodes",
+                )
+                continue
+
+            # Commit the placement so that the next candidates see the
+            # remaining capacity.
+            hosts = trial_hosts
+            receiving_node_ids.update(
+                host.ray_node_id
+                for host in hosts
+                if len(host.get_sched_requests(ResourceRequestSource.PENDING_DEMAND))
+                > num_requests_before[host.ray_node_id]
+            )
+            drained_by_type[node.node_type] += 1
+            num_selected += 1
+
+            utilization = drain_input.node_utilization.get(node.ray_node_id, 0.0)
+            duration_s = (
+                drain_input.underutilized_duration_ms.get(node.ray_node_id, 0) / 1000
+            )
+            details = (
+                f"{UNDERUTILIZED_DRAIN_DETAILS_PREFIX}: dominant utilization "
+                f"{utilization:.2f} for {duration_s:.0f}s, {workload.summary()}"
+            )
+            if config.dry_run:
+                logger.info(f"[dry run] Would drain node {node.ray_node_id}: {details}")
+                continue
+
+            logger.info(f"Draining node {node.ray_node_id}: {details}")
+            node.status = SchedulingNodeStatus.TO_TERMINATE
+            node.termination_request = TerminationRequest(
+                id=str(uuid.uuid4()),
+                instance_id=node.im_instance_id,
+                ray_node_id=node.ray_node_id,
+                # No dedicated cause, to avoid a protobuf change. The drain is
+                # identified by the details prefix.
+                cause=TerminationRequest.Cause.UNKNOWN,
+                instance_type=node.node_type,
+                instance_status=node.im_instance_status,
+                details=details,
+            )
+
+        ctx.update(nodes)
+
+    @staticmethod
+    def _get_underutilized_drain_skip_reason(
+        node: SchedulingNode,
+        workload: NodeWorkload,
+        drain_input: UnderutilizedDrainInput,
+    ) -> Optional[str]:
+        """Returns why the node shouldn't be drained, None if it could be."""
+        if node.node_kind == NodeKind.HEAD:
+            return "head node"
+        if node.status != SchedulingNodeStatus.SCHEDULABLE:
+            return f"node status {node.status.value}"
+        if node.im_instance_status != Instance.RAY_RUNNING:
+            return "ray is not running"
+        if node.node_type in drain_input.config.disabled_node_types:
+            return f"disabled for node type {node.node_type}"
+        if node.get_sched_requests(ResourceRequestSource.PENDING_DEMAND):
+            return "needed_by_demand: pending demands are scheduled on the node"
+        if node.get_sched_requests(ResourceRequestSource.CLUSTER_RESOURCE_CONSTRAINT):
+            return "needed_by_demand: resource constraints are scheduled on the node"
+        return get_workload_skip_reason(workload, drain_input.config)
+
+    @staticmethod
+    def _with_capped_headroom(
+        node: SchedulingNode, max_utilization: float
+    ) -> SchedulingNode:
+        """
+        Returns a copy of the node whose available resources for pending demands
+        are capped, so that placing more requests doesn't push any resource
+        above `max_utilization`. Resources already above it get no headroom,
+        without vetoing the use of the other resources of the node.
+        """
+        node = copy.deepcopy(node)
+        available = node.get_available_resources(ResourceRequestSource.PENDING_DEMAND)
+        for resource_name, total in node.total_resources.items():
+            if total <= 0 or not is_workload_resource(resource_name):
+                continue
+            current = available.get(resource_name, 0.0)
+            used = total - current
+            available[resource_name] = max(
+                0.0, min(current, total * max_utilization - used)
+            )
+        return node
+
+    @staticmethod
+    def _schedule_on_existing_nodes(
+        nodes: List[SchedulingNode],
+        requests: List[ResourceRequest],
+    ) -> Tuple[List[SchedulingNode], List[ResourceRequest]]:
+        """
+        Bin-pack the requests onto the given nodes only (no new nodes).
+
+        Args:
+            nodes: The nodes to schedule the requests on.
+            requests: The requests to schedule.
+
+        Returns:
+            - The nodes after scheduling.
+            - The requests that couldn't be scheduled.
+        """
+        # Larger (and GPU) requests first, for a better packing.
+        requests = sorted(
+            requests,
+            key=lambda r: (
+                r.resources_bundle.get("GPU", 0),
+                len(r.label_selectors),
+                len(r.resources_bundle),
+                sum(r.resources_bundle.values()),
+            ),
+            reverse=True,
+        )
+        scheduled_nodes = []
+        remaining_nodes = list(nodes)
+        while requests and remaining_nodes:
+            (
+                best_node,
+                requests,
+                remaining_nodes,
+            ) = ResourceDemandScheduler._sched_best_node(
+                requests,
+                remaining_nodes,
+                ResourceRequestSource.PENDING_DEMAND,
+                cloud_resource_availabilities={},
+                recoverable_resource_availabilities={},
+            )
+            if best_node is None:
+                break
+            scheduled_nodes.append(best_node)
+        return scheduled_nodes + remaining_nodes, requests

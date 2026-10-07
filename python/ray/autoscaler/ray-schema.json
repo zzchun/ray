@@ -38,6 +38,40 @@
             "type": "number",
             "minimum": 0
         },
+        "underutilized_node_drain": {
+            "description": "(Autoscaler v2 only) Drain worker nodes that stay underutilized, if their actors and running tasks fit on the remaining nodes. Disabled by default.",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "enabled": {"type": "boolean"},
+                "dry_run": {"type": "boolean"},
+                "evaluation_interval_s": {"type": "number", "minimum": 0},
+                "max_candidates_to_inspect": {"type": "integer", "minimum": 0},
+                "utilization_threshold": {"type": "number", "minimum": 0, "maximum": 1},
+                "underutilized_duration_s": {"type": "number", "minimum": 0},
+                "max_nodes_per_round": {"type": "integer", "minimum": 0},
+                "max_concurrent_draining": {
+                    "description": "Either a number of nodes, or a percentage of the worker nodes such as \"10%\".",
+                    "oneOf": [
+                        {"type": "integer", "minimum": 0},
+                        {"type": "string", "pattern": "^\\s*\\d+(\\.\\d+)?%\\s*$"}
+                    ]
+                },
+                "drain_grace_period_s": {"type": "number", "minimum": 0},
+                "termination_buffer_s": {"type": "number", "minimum": 0},
+                "ray_stopping_timeout_s": {"type": "number", "minimum": 0},
+                "max_running_tasks_per_node": {"type": "integer", "minimum": 0},
+                "max_actors_per_node": {"type": "integer", "minimum": 0},
+                "max_object_store_used_bytes": {"type": "number", "minimum": 0},
+                "skip_if_actor_owns_objects": {"type": "boolean"},
+                "post_drain_max_utilization": {"type": "number", "minimum": 0, "maximum": 1},
+                "cooldown_after_scale_up_s": {"type": "number", "minimum": 0},
+                "excluded_namespaces": {"type": "array", "items": {"type": "string"}},
+                "excluded_job_ids": {"type": "array", "items": {"type": "string"}},
+                "rpc_timeout_s": {"type": "number", "minimum": 0},
+                "resource_reconcile_tolerance": {"type": "number", "minimum": 0}
+            }
+        },
         "provider": {
             "type": "object",
             "description": "Cloud-provider specific configuration.",
@@ -370,6 +404,11 @@
                        "min_workers": {"type": "integer"},
                        "max_workers": {"type": "integer"},
                        "idle_timeout_s": {"type": "number", "nullable": true},
+                       "underutilized_node_drain": {
+                           "type": "object",
+                           "additionalProperties": false,
+                           "properties": {"enabled": {"type": "boolean"}}
+                       },
                        "priority": {"type": "integer"},
                        "resources": {
 						   "type": "object",

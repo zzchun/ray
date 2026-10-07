@@ -34,6 +34,7 @@ py_test_module_list(
         "tests/test_storage.py",
         "tests/test_subscribers.py",
         "tests/test_threaded_ray_installer.py",
+        "tests/test_underutilized_drain.py",
         "tests/test_utils.py",
     ],
     tags = ["team:core"],

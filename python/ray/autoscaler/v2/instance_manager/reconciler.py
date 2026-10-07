@@ -34,6 +34,7 @@ from ray.autoscaler.v2.instance_manager.subscribers.threaded_ray_installer impor
 from ray.autoscaler.v2.metrics_reporter import AutoscalerMetricsReporter
 from ray.autoscaler.v2.scheduler import IResourceScheduler, SchedulingRequest
 from ray.autoscaler.v2.schema import AutoscalerInstance, NodeType
+from ray.autoscaler.v2.underutilized_drain import UnderutilizedNodeDrainer
 from ray.autoscaler.v2.utils import is_head_node
 from ray.core.generated.autoscaler_pb2 import (
     AutoscalingState,
@@ -76,6 +77,7 @@ class Reconciler:
         ray_install_errors: Optional[List[RayInstallError]] = None,
         ray_stop_errors: Optional[List[RayStopError]] = None,
         metrics_reporter: Optional[AutoscalerMetricsReporter] = None,
+        underutilized_drainer: Optional[UnderutilizedNodeDrainer] = None,
         _logger: Optional[logging.Logger] = None,
     ) -> AutoscalingState:
         """
@@ -109,6 +111,8 @@ class Reconciler:
             ray_stop_errors: The errors from RayStopper.
             metrics_reporter: The metric reporter to report the autoscaler
                 metrics.
+            underutilized_drainer: Drains the underutilized nodes, None to
+                disable it.
             _logger: The logger (for testing).
 
         Returns:
@@ -142,6 +146,7 @@ class Reconciler:
             ray_cluster_resource_state=ray_cluster_resource_state,
             non_terminated_cloud_instances=non_terminated_cloud_instances,
             autoscaling_config=autoscaling_config,
+            underutilized_drainer=underutilized_drainer,
             _logger=_logger,
         )
 
@@ -252,6 +257,7 @@ class Reconciler:
         ray_cluster_resource_state: ClusterResourceState,
         non_terminated_cloud_instances: Dict[CloudInstanceId, CloudInstance],
         autoscaling_config: AutoscalingConfig,
+        underutilized_drainer: Optional[UnderutilizedNodeDrainer] = None,
         _logger: Optional[logging.Logger] = None,
     ):
         """
@@ -290,6 +296,8 @@ class Reconciler:
             non_terminated_cloud_instances: The non-terminated cloud instances
                 from the cloud provider.
             autoscaling_config: The autoscaling config.
+            underutilized_drainer: Drains the underutilized nodes, None to
+                disable it.
             _logger: The logger (for testing).
         """
 
@@ -302,6 +310,7 @@ class Reconciler:
             instance_manager=instance_manager,
             reconcile_config=autoscaling_config.get_instance_reconcile_config(),
             _logger=_logger or logger,
+            underutilized_drainer=underutilized_drainer,
         )
 
         Reconciler._scale_cluster(
@@ -312,6 +321,7 @@ class Reconciler:
             scheduler=scheduler,
             autoscaling_config=autoscaling_config,
             cloud_provider=cloud_provider,
+            underutilized_drainer=underutilized_drainer,
         )
 
         # Fix: Terminate instances before launching new ones
@@ -1000,6 +1010,7 @@ class Reconciler:
         instance_manager: InstanceManager,
         reconcile_config: InstanceReconcileConfig,
         _logger: logging.Logger,
+        underutilized_drainer: Optional[UnderutilizedNodeDrainer] = None,
     ):
         """
         Handle stuck instances with timeouts.
@@ -1009,6 +1020,9 @@ class Reconciler:
             - ALLOCATED: ray fails to be started on the instance.
             - RAY_INSTALLING: ray fails to be installed on the instance.
             - TERMINATING: cloud provider is slow/fails to terminate instances.
+            - RAY_STOPPING: only for the nodes drained for underutilization, whose
+                actors would never let them become idle. They are terminated once
+                the drain deadline passes (see `UnderutilizedNodeDrainer`).
 
         Instances could be in the following status which could be unbounded or
         transient, and we don't have a timeout mechanism to handle them. We would
@@ -1028,6 +1042,8 @@ class Reconciler:
             instance_manager: The instance manager to reconcile.
             reconcile_config: The instance reconcile config.
             _logger: The logger to log the warning messages. It's used for testing.
+            underutilized_drainer: Drains the underutilized nodes, None to
+                disable it.
 
         """
         instances, version = Reconciler._get_im_instances(instance_manager)
@@ -1104,6 +1120,37 @@ class Reconciler:
             )
             if update:
                 im_updates[instance.instance_id] = update
+
+        # Terminate the instances drained for underutilization once their drain
+        # deadline passes. Terminating the instance (instead of shutting down the
+        # raylet) after the deadline makes Ray treat the node death as a
+        # preemption, so actor restarts and task retries aren't counted.
+        if underutilized_drainer is not None:
+            to_terminate = underutilized_drainer.get_instances_to_terminate(
+                instances_by_status[IMInstance.RAY_STOPPING],
+                ray_stopping_since_s=lambda instance: sorted(
+                    InstanceUtil.get_status_transition_times_ns(
+                        instance, IMInstance.RAY_STOPPING
+                    )
+                )[-1]
+                / 1e9,
+            )
+            for instance in instances_by_status[IMInstance.RAY_STOPPING]:
+                reason = to_terminate.get(instance.instance_id)
+                if reason is None:
+                    continue
+                if not instance.cloud_instance_id:
+                    _logger.warning(
+                        f"Can't terminate draining instance {instance.instance_id} "
+                        f"({reason}): no cloud instance id."
+                    )
+                    continue
+                im_updates[instance.instance_id] = IMInstanceUpdateEvent(
+                    instance_id=instance.instance_id,
+                    new_instance_status=IMInstance.TERMINATING,
+                    cloud_instance_id=instance.cloud_instance_id,
+                    details=f"terminating draining node: {reason}",
+                )
 
         # These statues could be unbounded or transient, and we don't have a timeout
         # mechanism to handle them. We only warn if they are stuck for too long.
@@ -1194,6 +1241,7 @@ class Reconciler:
         scheduler: IResourceScheduler,
         autoscaling_config: AutoscalingConfig,
         cloud_provider: ICloudInstanceProvider,
+        underutilized_drainer: Optional[UnderutilizedNodeDrainer] = None,
     ) -> None:
         """
         Scale the cluster based on the resource state and the resource scheduler's
@@ -1212,6 +1260,8 @@ class Reconciler:
             scheduler: The resource scheduler to make scaling decisions.
             autoscaling_config: The autoscaling config.
             cloud_provider: The cloud provider interface.
+            underutilized_drainer: Drains the underutilized nodes, None to
+                disable it.
         """
 
         # Get the current instance states.
@@ -1264,6 +1314,16 @@ class Reconciler:
             sched_request.ippr_specs = cloud_provider.get_ippr_specs()
             sched_request.ippr_statuses = cloud_provider.get_ippr_statuses()
 
+        if underutilized_drainer is not None:
+            try:
+                sched_request.underutilized_drain = underutilized_drainer.prepare(
+                    autoscaling_config.get_underutilized_node_drain_config(),
+                    ray_state,
+                    im_instances,
+                )
+            except Exception:
+                logger.exception("Failed to prepare the underutilized node drain.")
+
         # Ask scheduler for updates to the cluster shape.
         reply = scheduler.schedule(sched_request)
 
@@ -1293,6 +1353,10 @@ class Reconciler:
         # Scale the clusters if needed.
         to_launch = reply.to_launch
         to_terminate = reply.to_terminate
+        if underutilized_drainer is not None:
+            # Record the drains before the instances transition to
+            # RAY_STOP_REQUESTED, which notifies the RayStopper.
+            underutilized_drainer.on_scheduled(to_terminate)
         updates = {}
         # Add terminating instances.
         for terminate_request in to_terminate:

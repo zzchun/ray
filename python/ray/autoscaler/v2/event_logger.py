@@ -3,6 +3,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional
 
 from ray._private.event.event_logger import EventLoggerAdapter
+from ray.autoscaler.v2.underutilized_drain import is_underutilized_drain_request
 from ray.autoscaler.v2.utils import ResourceRequestUtil
 from ray.core.generated.autoscaler_pb2 import (
     ClusterResourceConstraint,
@@ -78,10 +79,6 @@ class AutoscalerEventLogger:
 
         # Log any terminate events.
         if self._log_cluster_shape and terminate_requests:
-            termination_by_causes_and_type = defaultdict(int)
-            for req in terminate_requests:
-                termination_by_causes_and_type[(req.cause, req.instance_type)] += 1
-
             cause_reason_map = {
                 TerminationRequest.Cause.OUTDATED: "outdated",
                 TerminationRequest.Cause.MAX_NUM_NODES: "max number of worker nodes reached",  # noqa
@@ -89,10 +86,18 @@ class AutoscalerEventLogger:
                 TerminationRequest.Cause.IDLE: "idle",
             }
 
-            for idx, ((cause, instance_type), count) in enumerate(
-                termination_by_causes_and_type.items()
+            termination_by_reasons_and_type = defaultdict(int)
+            for req in terminate_requests:
+                if is_underutilized_drain_request(req):
+                    reason = "underutilized"
+                else:
+                    reason = cause_reason_map.get(req.cause, "unknown")
+                termination_by_reasons_and_type[(reason, req.instance_type)] += 1
+
+            for idx, ((reason, instance_type), count) in enumerate(
+                termination_by_reasons_and_type.items()
             ):
-                log_str = f"Removing {count} nodes of type {instance_type} ({cause_reason_map[cause]})."  # noqa
+                log_str = f"Removing {count} nodes of type {instance_type} ({reason})."  # noqa
                 self._logger.info(f"{log_str}")
                 logger.info(f"{log_str}")
 
